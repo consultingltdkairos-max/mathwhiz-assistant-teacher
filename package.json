@@ -1,0 +1,21 @@
+{
+  "description": "Brain service for the Mathwhiz AI Assistant Teacher pilot (Recall.ai bot layer). Includes a fully local end-to-end demo (npm run demo): mock Recall harness + stub platform, no external calls.",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.0"
+  },
+  "name": "mathwhiz-zoom-assistant-service",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "demo": "tsx src/demo/runDemo.ts",
+    "test:e2e": "tsx src/demo/runDemo.ts",
+    "bot:create-test": "tsx src/scripts/createTestBot.ts"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}
