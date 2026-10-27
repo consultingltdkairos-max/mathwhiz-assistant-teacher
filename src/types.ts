@@ -85,7 +85,9 @@ export type CheckInOutcome =
 
 export interface CheckIn {
   id: string;
-  question: string;
+  /** The teacher's expected answer for this round. There is deliberately
+   *  no question field: the question lives on the teacher's board and is
+   *  never held or relayed by the bot (correction, 27 Oct 2026). */
   expectedAnswer: string;
   mode: CheckInMode;
   windowMs: number;

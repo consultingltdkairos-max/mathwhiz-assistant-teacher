@@ -1,7 +1,10 @@
 // Teacher nudges, spec v1 Section 1.6. Private to the teacher only.
-// Rules: no response in a check-in window; no signal of any kind 20
-// minutes into class. Cap: 1 nudge per student per class segment.
+// Rule kept here: no signal of any kind 20 minutes into class.
+// Cap: 1 nudge per student per class segment.
 // Teacher controls: PAUSE / RESUME / STOP by DM.
+// (Answer-round non-response is no longer nudged per student from here:
+// since the 27 Oct 2026 correction, SessionManager reports it as ONE
+// combined DM when the round closes.)
 
 import type { SignalTracker } from "./SignalTracker.js";
 
@@ -25,13 +28,6 @@ export class NudgeEngine {
 
   get silenced(): boolean {
     return this.paused || this.stopped;
-  }
-
-  /** Check-in non-response nudge text for one student, or null if capped. */
-  checkInNudge(studentId: string, displayName: string, segment: string): string | null {
-    if (this.silenced || !this.claim(studentId, segment)) return null;
-    this.tracker.nudgeSent(studentId);
-    return `No response from ${displayName} in this check in yet.`;
   }
 
   /** Silent-so-far nudges due at `now`. Caller DMs each to the teacher. */

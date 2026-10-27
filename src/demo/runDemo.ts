@@ -42,6 +42,8 @@ function check(label: string, cond: boolean, detail = ""): void {
 const SESSION_1 = "55555555-5555-4555-8555-555555555555";
 const SESSION_2 = "66666666-6666-4666-8666-666666666666";
 const SESSION_3 = "88888888-8888-4888-8888-888888888888";
+const SESSION_4 = "99999999-9999-4999-8999-999999999999";
+const SESSION_5 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const COHORT = "77777777-7777-4777-8777-777777777777";
 const AMARA = "11111111-1111-4111-8111-111111111111";
 const DEVONTE = "22222222-2222-4222-8222-222222222222";
@@ -107,7 +109,9 @@ async function main(): Promise<void> {
   await bot1.emit({ type: "transcript", participantId: "p-amara", name: "Amara Reid", text: "Miss, do we move the 3 to the other side first?", timestamp: fakeNow });
   await bot1.emit({ type: "transcript", participantId: "p-devonte", name: "Devonte Cole", text: "I got stuck on the first step.", timestamp: fakeNow });
 
-  advance(2 * MIN); // t+5: teacher opens a hint-mode check-in by DM
+  advance(2 * MIN); // t+5: teacher opens a hint-mode answer round by DM.
+  // Legacy CHECKIN format on purpose: it must still parse (liberal in,
+  // strict out), but the question text must NEVER be relayed to students.
   await bot1.emit({ type: "chat_message", participantId: "p-teacher", name: "Ms Rose Clarke", to: "bot", text: "CHECKIN | What is x if 2x + 3 = 17? | x = 7 | mode: hint", timestamp: fakeNow });
 
   advance(1 * MIN); // t+6: Amara answers publicly while the check-in is open
@@ -125,8 +129,8 @@ async function main(): Promise<void> {
   advance(0.5 * MIN); // t+8: the unmatched student answers too; nothing may be recorded
   await bot1.emit({ type: "chat_message", participantId: "p-shanice", name: "Shanice P.", to: "bot", text: "x = 7", timestamp: fakeNow });
 
-  advance(2 * MIN); // t+10: tick closes the check-in window -> tally + non-responder nudge
-  trace("-- tick (check-in window expired)");
+  advance(2 * MIN); // t+10: tick closes the answer-round window -> combined non-responder DM
+  trace("-- tick (answer-round window expired)");
   await mgr1.tick();
 
   advance(2 * MIN); // t+12: scripted safeguarding-style message from a matched student
@@ -175,7 +179,7 @@ async function main(): Promise<void> {
     check("Devonte extra reply was not a private question", devonte.evidence.private_questions === 0);
     check("Devonte indicator: Participates when called upon", devonte.indicators.includes("Participates when called upon"));
     const kezia = p1.entries.find((e) => e.student_id === KEZIA)!;
-    check("Kezia nudges_sent = 2 (check-in + silence)", kezia.evidence.nudges_sent === 2, `got ${kezia.evidence.nudges_sent}`);
+    check("Kezia nudges_sent = 2 (round close + silence)", kezia.evidence.nudges_sent === 2, `got ${kezia.evidence.nudges_sent}`);
     check("Kezia indicator: Limited participation", kezia.indicators.includes("Limited participation during class"));
     check("Kezia gap asks teacher to confirm", kezia.data_gaps.some((g) => g.includes("teacher to confirm")));
     const shanice = p1.entries.find((e) => e.student_id === SHANICE)!;
@@ -187,7 +191,11 @@ async function main(): Promise<void> {
   check("correct-with-hint reply DM went to Devonte", out.some((m) => m.kind === "dm" && m.toParticipantId === "p-devonte" && m.message.includes("with the hint")));
   check("extra reply from Devonte got the already-answered reply", out.some((m) => m.kind === "dm" && m.toParticipantId === "p-devonte" && m.message.includes("already have your answer")));
   check("correct reply DM went to Amara", out.some((m) => m.kind === "dm" && m.toParticipantId === "p-amara" && (m.message.startsWith("Yes") || m.message.startsWith("Correct"))));
-  check("check-in tally DM went to teacher, hint correct counted separately", out.some((m) => m.toParticipantId === "p-teacher" && m.message.includes("Check in closed: 2 answered, 1 correct, 1 correct with a hint")));
+  check("round-close DM names the one non-responder (Kezia)", out.some((m) => m.toParticipantId === "p-teacher" && m.message === "Haven't heard from Kezia Brown. Worth calling on them next."));
+  check(
+    "no question was ever sent to a student (answer-only model)",
+    !out.some((m) => m.kind === "dm" && m.toParticipantId !== "p-teacher" && (m.message.startsWith("Check in:") || m.message.includes("What is x if"))),
+  );
   check("safeguarding flag DM went to teacher", out.some((m) => m.toParticipantId === "p-teacher" && m.message.includes("Please check in with Devonte Cole")));
   check("kind safeguarding reply went to Devonte", out.some((m) => m.toParticipantId === "p-devonte" && m.message.includes("trusted adult")));
   check("silence nudge for Kezia went to teacher", out.some((m) => m.toParticipantId === "p-teacher" && m.message.includes("Haven't heard from Kezia Brown")));
@@ -307,10 +315,10 @@ async function main(): Promise<void> {
     check("Devonte answered = 1 (hint taken, no retry, settles incorrect)", d4.evidence.checkins_answered === 1);
   }
   const out4 = bot4.sent;
-  check("tally: 2 answered, 0 correct, no hint credit", out4.some((m) => m.toParticipantId === "p-teacher" && m.message.includes("Check in closed: 2 answered, 0 correct.")));
+  check("both answered, so the close DM is the all-answered one", out4.some((m) => m.toParticipantId === "p-teacher" && m.message === "Everyone answered that one."));
   check("wrong retry closed the question for Amara", out4.some((m) => m.toParticipantId === "p-amara" && m.message.includes("closes this check in")));
   check("third reply got the already-answered reply", out4.some((m) => m.toParticipantId === "p-amara" && m.message.includes("already have your answer")));
-  check("no non-responder nudge for Amara or Devonte", !out4.some((m) => m.toParticipantId === "p-teacher" && (m.message.includes("No response from Amara") || m.message.includes("No response from Devonte"))));
+  check("no non-responder DM for Amara or Devonte", !out4.some((m) => m.toParticipantId === "p-teacher" && (m.message.includes("Haven't heard from Amara") || m.message.includes("Haven't heard from Devonte"))));
 
   // ================================================================
   heading("SCENARIO 5: real RecallBotProvider, fake HTTP layer");
@@ -477,6 +485,94 @@ async function main(): Promise<void> {
     "verifyWebhook fails closed when the secret lacks the whsec_ prefix",
     noPrefixVerifier.verifyWebhook(whBody, whHeaders) === false,
   );
+
+  // ================================================================
+  heading("SCENARIO 7: answer-only rounds (27 Oct 2026 correction) + draft safety");
+  // ================================================================
+  // The corrected classroom model: the teacher opens a round with the
+  // expected answer ONLY (ANSWER command); nothing is sent to students;
+  // students DM answers; the round-close report is ONE combined DM.
+  fakeNow = Date.parse("2026-10-29T15:00:00.000Z");
+  const bot7 = new MockBotProvider(trace);
+  const ctx7: SessionContext = {
+    sessionId: SESSION_4,
+    cohortId: COHORT,
+    meetingUrl: "https://zoom.us/j/00000000000",
+    joinAt: new Date(fakeNow).toISOString(),
+    teacherParticipantId: null,
+    roster: roster().slice(0, 3), // Amara, Devonte, Kezia
+  };
+  const mgr7 = new SessionManager(ctx7, bot7, platform);
+  bot7.onEvent((botId, ev) => mgr7.handleEvent(botId, ev));
+  await mgr7.start();
+  await bot7.emit({ type: "bot_status", status: "in_call" });
+  await bot7.emit({ type: "participant_joined", participantId: "p-teacher", name: "Ms Rose Clarke", isHost: true });
+  await bot7.emit({ type: "participant_joined", participantId: "p-amara", name: "Amara Reid", isHost: false });
+  await bot7.emit({ type: "participant_joined", participantId: "p-devonte", name: "Devonte Cole", isHost: false });
+  await bot7.emit({ type: "participant_joined", participantId: "p-kezia", name: "Kezia Brown", isHost: false });
+
+  // Round 1: ANSWER command, mode given. Only Amara replies.
+  const sentBeforeOpen = bot7.sent.length;
+  await bot7.emit({ type: "chat_message", participantId: "p-teacher", name: "Ms Rose Clarke", to: "bot", text: "ANSWER | 42 | mode: hint", timestamp: fakeNow });
+  const afterOpen = bot7.sent.slice(sentBeforeOpen);
+  check("opening an answer round sent NOTHING to students", afterOpen.every((m) => m.kind === "dm" && m.toParticipantId === "p-teacher"), `${afterOpen.length} message(s), all to the teacher`);
+  check("teacher got the round-open confirmation", afterOpen.some((m) => m.toParticipantId === "p-teacher" && m.message.includes("Answer round open for 3 students")));
+  await bot7.emit({ type: "chat_message", participantId: "p-amara", name: "Amara Reid", to: "bot", text: "42", timestamp: fakeNow });
+  advance(4 * MIN); // past the 3-minute window; Devonte and Kezia stayed silent
+  trace("-- tick (answer-round window expired)");
+  await mgr7.tick();
+
+  // Round 2: ANSWER with no mode (defaults to hint). Everyone answers,
+  // Devonte via his hint retry, so the round must close EARLY, the moment
+  // the last outstanding answer lands, with no tick involved.
+  await bot7.emit({ type: "chat_message", participantId: "p-teacher", name: "Ms Rose Clarke", to: "bot", text: "ANSWER | 5", timestamp: fakeNow });
+  await bot7.emit({ type: "chat_message", participantId: "p-amara", name: "Amara Reid", to: "bot", text: "5", timestamp: fakeNow });
+  await bot7.emit({ type: "chat_message", participantId: "p-devonte", name: "Devonte Cole", to: "bot", text: "6", timestamp: fakeNow });
+  await bot7.emit({ type: "chat_message", participantId: "p-kezia", name: "Kezia Brown", to: "bot", text: "5", timestamp: fakeNow });
+  await bot7.emit({ type: "chat_message", participantId: "p-devonte", name: "Devonte Cole", to: "bot", text: "5", timestamp: fakeNow });
+  advance(1 * MIN);
+  trace("-- tick (after the early close; must be a no-op for round 2)");
+  await mgr7.tick();
+  await bot7.emit({ type: "bot_status", status: "call_ended" });
+
+  heading("Scenario 7: assertions");
+  const out7 = bot7.sent;
+  check(
+    "combined non-responder DM names BOTH silent students",
+    out7.some((m) => m.toParticipantId === "p-teacher" && m.message === "Haven't heard from Devonte Cole, Kezia Brown. Worth calling on them next."),
+  );
+  check("all-answered DM sent once, on the early close", out7.filter((m) => m.toParticipantId === "p-teacher" && m.message === "Everyone answered that one.").length === 1);
+  check("no per-student non-response nudges remain", !out7.some((m) => m.message.includes("in this check in yet")));
+  check("Devonte's hint and correct-with-hint replies still work in answer rounds", out7.some((m) => m.toParticipantId === "p-devonte" && m.message.startsWith("Not quite")) && out7.some((m) => m.toParticipantId === "p-devonte" && m.message.includes("with the hint")));
+  const p7 = stub.received.find((p) => p.session_id === SESSION_4);
+  check("scenario 7 payload reached the stub", !!p7);
+  if (p7) {
+    const d7 = p7.entries.find((e) => e.student_id === DEVONTE)!;
+    check("Devonte check-ins sent = 2, answered = 1 across both rounds", d7.evidence.checkins_sent === 2 && d7.evidence.checkins_answered === 1);
+    const a7 = p7.entries.find((e) => e.student_id === AMARA)!;
+    check("Amara answered both rounds", a7.evidence.checkins_answered === 2);
+  }
+
+  // Draft safety: the platform post fails (unreachable base URL), yet
+  // the compiled draft must already be recorded and recoverable.
+  const failingPlatform = new PlatformClient(makeConfig("http://127.0.0.1:1"));
+  const bot8 = new MockBotProvider(trace);
+  const ctx8: SessionContext = {
+    sessionId: SESSION_5,
+    cohortId: COHORT,
+    meetingUrl: "https://zoom.us/j/00000000000",
+    joinAt: new Date(fakeNow).toISOString(),
+    teacherParticipantId: null,
+    roster: roster().slice(0, 1),
+  };
+  const mgr8 = new SessionManager(ctx8, bot8, failingPlatform);
+  bot8.onEvent((botId, ev) => mgr8.handleEvent(botId, ev));
+  await mgr8.start();
+  await bot8.emit({ type: "bot_status", status: "in_call" });
+  await bot8.emit({ type: "bot_status", status: "call_ended" });
+  check("draft recorded even though the platform post failed", mgr8.recordedDraft !== null && mgr8.recordedDraft.session_id === SESSION_5);
+  check("recorded draft carries its entries", (mgr8.recordedDraft?.entries.length ?? 0) === 1);
+  check("failed post reached no stub", !stub.received.some((p) => p.session_id === SESSION_5));
 
   await stub.stop();
   heading("RESULT");

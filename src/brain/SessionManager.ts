@@ -3,8 +3,8 @@
 
 import type { BotEvent, BotProvider } from "../bot/BotProvider.js";
 import type { PlatformClient } from "../platform/PlatformClient.js";
-import type { SessionContext } from "../types.js";
-import { CheckInEngine, parseCheckInCommand } from "./CheckInEngine.js";
+import type { ParticipationDraftPayload, SessionContext } from "../types.js";
+import { CheckInEngine, parseRoundCommand } from "./CheckInEngine.js";
 import { compileDraft } from "./Compiler.js";
 import { NudgeEngine } from "./NudgeEngine.js";
 import { RosterMatcher } from "./RosterMatcher.js";
@@ -13,9 +13,10 @@ import { SignalTracker } from "./SignalTracker.js";
 import { replyToStudentQuestion } from "./TutorResponder.js";
 
 export const JOIN_ANNOUNCEMENT =
-  "Hi everyone, I am the Assistant Teacher. I am an AI helper in this class. " +
-  "When your teacher runs a check in, I will send the question to you privately here. " +
-  "Reply to me privately with your answer. You can also message me any time you are stuck.";
+  "Hi everyone, I am the Assistant Teacher, an AI helper in this class. " +
+  "Your teacher will put questions on the board during class. When a question goes up, " +
+  "send your answer to me here in a private message and I will tell you if it is right. " +
+  "You can also message me any time you are stuck.";
 
 const DEFAULT_CLASS_DURATION_MS = 90 * 60 * 1000; // Mathwhiz classes: 1.5h
 
@@ -172,6 +173,11 @@ export class SessionManager {
         // kind "ignored" (reply after the outcome was final) is consumed
         // here too, so it is never mistaken for a private question.
         await this.bot.sendDirectMessage(this.botId, event.participantId, outcome.replyText);
+        // If that reply was the last outstanding one, close the round
+        // now rather than waiting for the window to expire.
+        if (outcome.kind === "scored" && this.checkIns.allFinal()) {
+          await this.closeRound(now);
+        }
         return;
       }
     }
@@ -189,45 +195,49 @@ export class SessionManager {
     if (!this.botId) return;
     if (this.nudges.handleTeacherCommand(text)) return;
 
-    const cmd = parseCheckInCommand(text);
+    const cmd = parseRoundCommand(text);
     if (cmd) {
       const studentIds = this.ctx.roster.map((r) => r.studentId).filter((id) => this.presentStudents.has(id));
       this.checkIns.open(cmd, studentIds, now);
       this.tracker.checkInSent(studentIds);
-      for (const m of this.matcher.all()) {
-        if (m.studentId && this.presentStudents.has(m.studentId)) {
-          await this.bot.sendDirectMessage(this.botId, m.participantId, `Check in: ${cmd.question}`);
-        }
-      }
-      await this.dmTeacher(`Check in sent to ${studentIds.length} students. Window: ${Math.round(cmd.windowMs / 60000)} minutes.`);
+      // Answer-only model: the question is on the teacher's board, so
+      // opening a round sends NOTHING to students. Students DM their
+      // answers to the bot; the bot scores them as they arrive.
+      await this.dmTeacher(
+        `Answer round open for ${studentIds.length} students. Window: ${Math.round(cmd.windowMs / 60000)} minutes. ` +
+          `I have sent nothing; students will send me their answers.`,
+      );
       return;
     }
 
     await this.dmTeacher(
-      "I did not recognise that. Commands: CHECKIN | question | answer | mode: confirm-or-hint, or PAUSE / RESUME / STOP.",
+      "I did not recognise that. Commands: ANSWER | expected answer | mode: confirm-or-hint (mode optional, default hint), or PAUSE / RESUME / STOP.",
     );
   }
 
-  /** Periodic tick (server calls every ~15s): close expired check-ins,
-   *  send tallies and nudges. */
+  /** Close the open answer round and send the teacher the ONE combined
+   *  report: who has not answered, or that everyone answered. Used both
+   *  at window expiry (tick) and for the early close the moment the last
+   *  outstanding student answers. */
+  private async closeRound(now: number): Promise<void> {
+    const tally = this.checkIns.close(now);
+    if (!tally) return;
+    if (tally.nonResponders.length > 0) {
+      const names = tally.nonResponders.map((id) => this.displayNameFor(id));
+      for (const id of tally.nonResponders) this.tracker.nudgeSent(id);
+      await this.dmTeacher(`Haven't heard from ${names.join(", ")}. Worth calling on them next.`);
+    } else {
+      await this.dmTeacher("Everyone answered that one.");
+    }
+  }
+
+  /** Periodic tick (server calls every ~15s): close an expired answer
+   *  round (one combined report to the teacher) and send silence nudges. */
   async tick(): Promise<void> {
     const now = Date.now();
     const active = this.checkIns.active;
     if (active && active.closedAt === null && now - active.openedAt > active.windowMs) {
-      const tally = this.checkIns.close(now);
-      if (tally) {
-        const hintPart =
-          tally.correctWithHint > 0 ? `, ${tally.correctWithHint} correct with a hint` : "";
-        await this.dmTeacher(
-          `Check in closed: ${tally.answered} answered, ${tally.correct} correct${hintPart}. No response from ${tally.nonResponders.length} student(s).`,
-        );
-        const segment = now - this.startedAt < DEFAULT_CLASS_DURATION_MS / 2 ? "early" : "late";
-        for (const studentId of tally.nonResponders) {
-          const name = this.displayNameFor(studentId);
-          const text = this.nudges.checkInNudge(studentId, name, segment);
-          if (text) await this.dmTeacher(text);
-        }
-      }
+      await this.closeRound(now);
     }
 
     const segment = now - this.startedAt < DEFAULT_CLASS_DURATION_MS / 2 ? "early" : "late";
@@ -244,11 +254,24 @@ export class SessionManager {
     for (const n of due) await this.dmTeacher(n.text);
   }
 
-  /** Compile the draft and post it, then leave. Idempotent per session. */
+  /** Compile the draft, record it durably, post it, then leave.
+   *  The compiled payload is recorded BEFORE the post is attempted
+   *  (in memory and as one structured log line) and the session is only
+   *  marked finalised after the post attempt resolves, so a failed post
+   *  (for example while the platform endpoint is unpublished) never
+   *  loses the draft: it stays recoverable from the service logs and a
+   *  later finalise() call retries the post. */
   private finalised = false;
+  private recordedDraftPayload: ParticipationDraftPayload | null = null;
+
+  /** The most recently compiled participation draft, recorded before
+   *  any post attempt. Null until the first finalise() compiles one. */
+  get recordedDraft(): ParticipationDraftPayload | null {
+    return this.recordedDraftPayload;
+  }
+
   async finalise(): Promise<void> {
     if (this.finalised) return;
-    this.finalised = true;
     const payload = compileDraft({
       ctx: this.ctx,
       tracker: this.tracker,
@@ -256,8 +279,20 @@ export class SessionManager {
       assistantPresent: this.botInCall,
       presentStudentIds: this.presentStudents,
     });
-    const result = await this.platform.postParticipationDraft(payload);
-    this.log(`Draft posted: created=${result.created} updated=${result.updated} skipped=${result.skipped.length}`);
+    // Durable record first, post second (pilot safety fix, 27 Oct 2026).
+    this.recordedDraftPayload = payload;
+    this.log(`participation_draft ${JSON.stringify(payload)}`);
+    try {
+      const result = await this.platform.postParticipationDraft(payload);
+      this.log(`Draft posted: created=${result.created} updated=${result.updated} skipped=${result.skipped.length}`);
+      this.finalised = true;
+    } catch (err) {
+      this.log(
+        `Draft post FAILED; the compiled draft is recorded in the participation_draft log line above and in memory for recovery: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
     if (this.botId) {
       try {
         await this.bot.leaveCall(this.botId);
