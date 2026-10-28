@@ -230,16 +230,22 @@ export class RecallBotProvider implements BotProvider {
       case "participant_events.speech_off":
         return [{ type: "speech_off", participantId }];
       case "participant_events.chat_message": {
-        // Chat semantics CONFIRMED in the live Stage 0 test (Oct 26, 2026)
-        // via the bot's participant-events record: the event data carries
-        // `text` and `to`, where to="everyone" is a public message and
-        // to="only_bot" is a DM addressed to the bot. Private chats between
-        // other people are never in the bot's event stream. The exact
-        // nesting of these fields inside the live realtime webhook envelope
-        // is still to confirm once the service is hosted publicly.
+        // Chat semantics CONFIRMED in the live Stage 0 tests (Oct 26, 2026
+        // via the bot's participant-events record; Oct 28, 2026 against the
+        // live realtime webhook): the event data carries `text` and `to`,
+        // where to="everyone" is a public message and to="only_bot" is a
+        // DM addressed to the bot. Private chats between other people are
+        // never in the bot's event stream.
+        // ENVELOPE (confirmed Oct 28, 2026): the realtime webhook nests the
+        // message one level deeper than the participant-events record:
+        // payload.data.data is { participant, timestamp, data: { text,
+        // to } }. Reading text/to from payload.data.data (the record
+        // shape) silently dropped every live chat message; that was the
+        // Stage 0 test 2/3/4 failure. Descend into data.data.data first,
+        // then fall back to the flatter shapes defensively.
         // Defensive rule: only surface messages addressed to everyone or
         // to the bot; NEVER surface a DM between other people.
-        const inner = data?.data ?? data;
+        const inner = data?.data?.data ?? data?.data ?? data;
         const text: string = inner?.text ?? inner?.message ?? "";
         const toRaw: string = String(inner?.to ?? inner?.type ?? "everyone");
         const to = toRaw === "everyone" ? "everyone" : "bot";
