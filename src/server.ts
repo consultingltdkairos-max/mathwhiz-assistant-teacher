@@ -52,9 +52,13 @@ export function startServer(cfg: ServiceConfig): void {
         const mgr = new SessionManager(ctx, bot, platform);
         bySession.set(ctx.sessionId, mgr);
         await mgr.start();
-        // SessionManager learns its botId internally; register the mapping
-        // by polling bot metadata is TODO. For the pilot, start-session is
-        // called per class and the webhook bot id is matched on first event.
+        // Register the botId -> manager mapping so this bot's webhook
+        // events actually reach the manager (the onEvent handler above
+        // looks managers up by bot id). Without this, events verify and
+        // are then silently dropped; that is the bug Stage 0 test 2
+        // caught on Oct 28, 2026.
+        const newBotId = mgr.currentBotId;
+        if (newBotId) sessions.set(newBotId, mgr);
         return json(res, 200, { ok: true, session_id: ctx.sessionId });
       }
 
@@ -64,6 +68,8 @@ export function startServer(cfg: ServiceConfig): void {
         if (!mgr) return json(res, 404, { error: "unknown session" });
         await mgr.endNow();
         bySession.delete(session_id);
+        const endedBotId = mgr.currentBotId;
+        if (endedBotId) sessions.delete(endedBotId);
         return json(res, 200, { ok: true });
       }
 

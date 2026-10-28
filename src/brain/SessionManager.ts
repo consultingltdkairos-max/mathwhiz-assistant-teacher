@@ -26,6 +26,11 @@ export class SessionManager {
   private checkIns = new CheckInEngine();
   private nudges: NudgeEngine;
   private botId: string | null = null;
+  /** The Recall bot id created by start(), or null before it runs. The
+   *  HTTP server needs it to route this bot's webhook events here. */
+  get currentBotId(): string | null {
+    return this.botId;
+  }
   private botInCall = false;
   private presentParticipants = new Set<string>();
   private presentStudents = new Set<string>();
