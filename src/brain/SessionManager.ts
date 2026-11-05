@@ -4,7 +4,14 @@
 import type { BotEvent, BotProvider } from "../bot/BotProvider.js";
 import type { PlatformClient } from "../platform/PlatformClient.js";
 import type { ParticipationDraftPayload, SessionContext } from "../types.js";
-import { CheckInEngine, answersMatch, parseRoundCommand } from "./CheckInEngine.js";
+import {
+  CheckInEngine,
+  answersMatch,
+  formatWindowMs,
+  parseRoundCommand,
+  splitAnswerLabel,
+} from "./CheckInEngine.js";
+import type { CheckIn } from "../types.js";
 import type { ScreenQuestion, VisionProvider } from "./Vision.js";
 import { compileDraft } from "./Compiler.js";
 import { NudgeEngine } from "./NudgeEngine.js";
@@ -41,6 +48,36 @@ export class SessionManager {
   /** The question read from the shared screen for the latest round, or
    *  null when screen reading is off, unavailable, or unreadable. */
   private screenQuestion: ScreenQuestion | null = null;
+  /** Every legible question read from the screen, by label ("" for a
+   *  single unlabelled question), for multi-question boards. */
+  private screenByLabel = new Map<string, ScreenQuestion>();
+  /** Round ids whose screen cross-check has already run (warn or pass),
+   *  so the teacher is warned once per round, never repeatedly. */
+  private crossCheckedRounds = new Set<string>();
+
+  private isTeacherName(name: string): boolean {
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const n = norm(name);
+    return (this.ctx.teacherNames ?? []).some((t) => norm(t) === n);
+  }
+
+  /** Recognise the teacher: the host always counts; otherwise a join or
+   *  rename under one of the session's teacher names counts when no
+   *  teacher has been recognised yet (Nov 5, 2026 finding: the teacher
+   *  on her own host account must be recognised reliably). */
+  private noteTeacher(participantId: string, name: string, isHost: boolean): boolean {
+    if (isHost) {
+      this.ctx.teacherParticipantId = participantId;
+      this.checkIns.setTeacherLabel(this.ctx.teacherLabel ?? name);
+      return true;
+    }
+    if (!this.ctx.teacherParticipantId && this.isTeacherName(name)) {
+      this.ctx.teacherParticipantId = participantId;
+      this.checkIns.setTeacherLabel(this.ctx.teacherLabel ?? name);
+      return true;
+    }
+    return this.isTeacher(participantId);
+  }
 
   constructor(
     private ctx: SessionContext,
@@ -84,10 +121,7 @@ export class SessionManager {
       }
       case "participant_joined": {
         this.presentParticipants.add(event.participantId);
-        if (event.isHost) {
-          this.ctx.teacherParticipantId = event.participantId;
-          this.checkIns.setTeacherLabel(event.name);
-        } else {
+        if (!this.noteTeacher(event.participantId, event.name, event.isHost)) {
           const match = this.matcher.match(event.participantId, event.name);
           if (match.studentId) this.presentStudents.add(match.studentId);
           if (match.confidence !== "high") {
@@ -101,7 +135,7 @@ export class SessionManager {
         break;
       }
       case "participant_updated": {
-        if (!this.isTeacher(event.participantId)) {
+        if (!this.noteTeacher(event.participantId, event.name, false)) {
           const match = this.matcher.match(event.participantId, event.name);
           if (match.studentId) this.presentStudents.add(match.studentId);
         }
@@ -168,8 +202,22 @@ export class SessionManager {
       return;
     }
 
+    // A student may label their answer ("Q2: 36") when several questions
+    // are open. The label is honoured only when that round exists and is
+    // open; otherwise the message is used exactly as sent.
+    const split = splitAnswerLabel(event.text);
+    let answerText = event.text;
+    let labelHint = "";
+    if (split.label) {
+      const r = this.checkIns.round(split.label);
+      if (r && r.closedAt === null) {
+        labelHint = split.label;
+        answerText = split.text;
+      }
+    }
+
     if (this.checkIns.isOpen(now)) {
-      const outcome = this.checkIns.recordReply(studentId, event.text, now);
+      const outcome = this.checkIns.recordReply(studentId, answerText, now, labelHint);
       if (outcome) {
         if (outcome.kind === "scored") {
           if (outcome.attempt === "first") {
@@ -181,33 +229,40 @@ export class SessionManager {
           }
           // A wrong retry needs no tracker call: the first reply already
           // counted the answer, as not correct.
+          let replyText = outcome.replyText;
+          // Real hint (Nov 5, 2026): a wrong FIRST reply in hint mode,
+          // with that round's screen question known, earns a hint written
+          // against the actual question and the student's actual wrong
+          // answer. Any vision failure keeps the pool reply.
+          const round = this.checkIns.round(outcome.roundLabel);
+          const q = this.questionFor(outcome.roundLabel);
+          if (outcome.attempt === "first" && !outcome.correct && round?.mode === "hint" && this.vision && q) {
+            const hint = await this.vision
+              .makeHint(q, round.expectedAnswer, answerText)
+              .catch(() => null);
+            if (hint) replyText = hint;
+          }
+          await this.bot.sendDirectMessage(this.botId, event.participantId, replyText);
+          // If that reply was the last outstanding one on its round,
+          // close that round now rather than waiting for expiry.
+          if (this.checkIns.allFinal(outcome.roundLabel)) {
+            await this.closeRound(outcome.roundLabel, now);
+          }
+          return;
         }
-        // kind "ignored" (reply after the outcome was final) is consumed
-        // here too, so it is never mistaken for a private question.
-        let replyText = outcome.replyText;
-        // Real hint (Nov 5, 2026): a wrong FIRST reply in hint mode, with
-        // the screen question known, earns a hint written against the
-        // actual question and the student's actual wrong answer. Any
-        // vision failure keeps the pool reply.
-        if (
-          outcome.kind === "scored" &&
-          outcome.attempt === "first" &&
-          !outcome.correct &&
-          this.checkIns.active?.mode === "hint" &&
-          this.vision &&
-          this.screenQuestion
-        ) {
-          const hint = await this.vision
-            .makeHint(this.screenQuestion, this.checkIns.active.expectedAnswer, event.text)
-            .catch(() => null);
-          if (hint) replyText = hint;
+        if (outcome.kind === "unsure") {
+          // Engaged and honest, never scored wrong. Counts as an answer
+          // for participation; the teacher hears about them at close.
+          if (outcome.firstReply) this.tracker.checkInResult(studentId, false, now);
+          await this.bot.sendDirectMessage(this.botId, event.participantId, outcome.replyText);
+          if (this.checkIns.allFinal(outcome.roundLabel)) {
+            await this.closeRound(outcome.roundLabel, now);
+          }
+          return;
         }
-        await this.bot.sendDirectMessage(this.botId, event.participantId, replyText);
-        // If that reply was the last outstanding one, close the round
-        // now rather than waiting for the window to expire.
-        if (outcome.kind === "scored" && this.checkIns.allFinal()) {
-          await this.closeRound(now);
-        }
+        // kind "needs_label" or "ignored": consumed here so the message
+        // is never mistaken for a private question.
+        await this.bot.sendDirectMessage(this.botId, event.participantId, outcome.replyText);
         return;
       }
     }
@@ -216,17 +271,28 @@ export class SessionManager {
     this.tracker.privateQuestion(studentId, now);
     const roundOpen = this.checkIns.isOpen(now);
     let reply = replyToStudentQuestion(event.text, roundOpen);
-    // Contextual help (Nov 5, 2026): outside an open round, with the
-    // screen question known, the vision provider answers against the
-    // actual question. During an open round the refusal above stands:
-    // the assistant never works an open check-in question for a student.
-    if (!roundOpen && this.vision && this.screenQuestion) {
+    // Controlled help (Nov 5, 2026 finding): help is for the work on the
+    // board in THIS class. Homework and assignment requests are refused
+    // deterministically here, and the vision prompt refuses them again.
+    const asksForAssignment = /\b(homework|assignment|take[- ]?home)\b/i.test(event.text);
+    if (!roundOpen && asksForAssignment) {
+      reply = "I can only help with the work we are doing in class right now. For that one, check with your teacher.";
+    } else if (!roundOpen && this.vision && this.screenQuestion) {
       const help = await this.vision
         .helpWithQuestion(this.screenQuestion, event.text)
         .catch(() => null);
       if (help) reply = help;
     }
     await this.bot.sendDirectMessage(this.botId, event.participantId, reply);
+  }
+
+  /** The screen question that belongs to a round: exact label match,
+   *  or the single question on screen when there is only one. */
+  private questionFor(label: string): ScreenQuestion | null {
+    const exact = this.screenByLabel.get(label);
+    if (exact) return exact;
+    if (this.screenByLabel.size === 1) return [...this.screenByLabel.values()][0];
+    return label === "" ? this.screenQuestion : null;
   }
 
   private async handleTeacherDm(text: string, now: number): Promise<void> {
@@ -236,73 +302,107 @@ export class SessionManager {
     const cmd = parseRoundCommand(text);
     if (cmd) {
       const studentIds = this.ctx.roster.map((r) => r.studentId).filter((id) => this.presentStudents.has(id));
-      this.checkIns.open(cmd, studentIds, now);
+      const round = this.checkIns.open(cmd, studentIds, now);
       this.tracker.checkInSent(studentIds);
       // Answer-only model: the question is on the teacher's board, so
       // opening a round sends NOTHING to students. Students DM their
       // answers to the bot; the bot scores them as they arrive.
+      const labelPart = cmd.label ? ` for Question ${cmd.label.slice(1)}` : "";
       await this.dmTeacher(
-        `Answer round open for ${studentIds.length} students. Window: ${Math.round(cmd.windowMs / 60000)} minutes. ` +
+        `Answer round open${labelPart} for ${studentIds.length} students. Window: ${formatWindowMs(cmd.windowMs)}. ` +
           `I have sent nothing; students will send me their answers.`,
       );
       // Screen read runs AFTER the confirmation, in the background: the
       // round never waits on vision. Any failure is silent (logged only).
-      void this.readScreenForRound(cmd);
+      void this.readScreenForRound(round);
       return;
     }
 
     await this.dmTeacher(
-      "I did not recognise that. Commands: ANSWER | expected answer | mode: confirm-or-hint (mode optional, default hint), or PAUSE / RESUME / STOP.",
+      "I did not recognise that. To open a round: ANSWER | expected answer | mode: hint, and you may add | time: 5 for a 5 minute window (or | time: 90s), or | Q2 when several questions are on the board. Also PAUSE / RESUME / STOP.",
     );
   }
 
-  /** Read the question on the shared screen for this round, keep it as
-   *  context for hints and student help, and privately warn the teacher
-   *  if the screen's worked answer disagrees with the round answer they
-   *  set (a mistyped expected answer would otherwise mark the whole
-   *  class wrong). Never throws, never blocks the round. */
-  private async readScreenForRound(cmd: { expectedAnswer: string }): Promise<void> {
-    try {
-      if (!this.botId || !this.vision) return;
-      const frame = await this.bot.getScreenFrame(this.botId);
-      if (!frame) {
-        this.log("screen read: no frame available for this round");
-        return;
+  /** Read the questions on the shared screen for this round, keep them
+   *  as context for hints and student help, and privately warn the
+   *  teacher if a screen question's worked answer disagrees with the
+   *  round answer she set (a mistyped expected answer would otherwise
+   *  mark the whole class wrong). Frames can lag the share by seconds,
+   *  so the read retries a few times inside the round window (Nov 5,
+   *  2026 finding: a single instant attempt missed in the tutor demo).
+   *  Never throws, never blocks the round. */
+  private async readScreenForRound(round: CheckIn): Promise<void> {
+    if (!this.botId || !this.vision) return;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (round.closedAt !== null) return;
+      try {
+        const frame = await this.bot.getScreenFrame(this.botId);
+        if (frame) {
+          const questions = await this.vision.readScreen(frame.pngBase64);
+          const legible = questions.filter((q) => q.legible && q.questionText);
+          if (legible.length > 0) {
+            for (const q of legible) {
+              this.screenByLabel.set(q.label, q);
+              this.screenQuestion = q;
+            }
+            this.log(
+              `screen read: ${legible.length} question(s) captured (${legible
+                .map((q) => q.questionText.slice(0, 60))
+                .join(" / ")})`,
+            );
+            await this.crossCheckRounds();
+            if (this.questionFor(round.label)) return;
+          } else {
+            this.log("screen read: no legible question on screen yet");
+          }
+        } else {
+          this.log("screen read: no frame available yet");
+        }
+      } catch (err) {
+        this.log(`screen read failed: ${err instanceof Error ? err.message : String(err)}`);
       }
-      const q = await this.vision.readQuestion(frame.pngBase64);
-      if (!q || !q.legible || !q.questionText) {
-        this.log("screen read: no legible question on screen");
-        this.screenQuestion = null;
-        return;
-      }
-      this.screenQuestion = q;
-      this.log(`screen read: question captured (${q.questionText.slice(0, 80)})`);
-      if (q.workedAnswer && !answersMatch(cmd.expectedAnswer, q.workedAnswer)) {
-        await this.dmTeacher(
-          `Heads up: the question on screen reads "${q.questionText}" and works out to ${q.workedAnswer}. ` +
-            `Your round answer is ${cmd.expectedAnswer}. You may want to check it before the round closes.`,
-        );
-      }
-    } catch (err) {
-      this.log(`screen read failed: ${err instanceof Error ? err.message : String(err)}`);
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 6000));
     }
   }
 
-  /** Close the open answer round and send the teacher the ONE combined
-   *  report: who has not answered, or that everyone answered. Used both
-   *  at window expiry (tick) and for the early close the moment the last
-   *  outstanding student answers. */
-  private async closeRound(now: number): Promise<void> {
-    const tally = this.checkIns.close(now);
+  /** Cross-check every open round once against the screen questions:
+   *  when a round's worked screen answer disagrees with the teacher's
+   *  expected answer, she gets ONE private heads-up for that round. */
+  private async crossCheckRounds(): Promise<void> {
+    const now = Date.now();
+    for (const round of this.checkIns.openRounds(now)) {
+      if (this.crossCheckedRounds.has(round.id)) continue;
+      const q = this.questionFor(round.label);
+      if (!q || !q.workedAnswer) continue;
+      this.crossCheckedRounds.add(round.id);
+      if (!answersMatch(round.expectedAnswer, q.workedAnswer)) {
+        const labelPart = round.label ? ` for Question ${round.label.slice(1)}` : "";
+        await this.dmTeacher(
+          `Heads up${labelPart}: the question on screen reads "${q.questionText}" and works out to ${q.workedAnswer}. ` +
+            `Your round answer is ${round.expectedAnswer}. You may want to check it before the round closes.`,
+        );
+      }
+    }
+  }
+
+  /** Close one answer round and send the teacher the ONE combined
+   *  private report for it: who has not answered, who said they were
+   *  not sure, and who answered incorrectly with the answer they sent.
+   *  Students who ended correct are not listed, and nothing is ever
+   *  announced publicly. Used at window expiry (tick) and for the early
+   *  close the moment the last outstanding student on the round answers. */
+  private async closeRound(label: string, now: number): Promise<void> {
+    const tally = this.checkIns.close(label, now);
     if (!tally) return;
-    // ONE combined report (Kevoy ruling, Nov 5, 2026): who has not
-    // answered, AND who answered incorrectly with the answer they sent.
-    // Students who ended correct are not listed.
     const parts: string[] = [];
     if (tally.nonResponders.length > 0) {
       const names = tally.nonResponders.map((id) => this.displayNameFor(id));
       for (const id of tally.nonResponders) this.tracker.nudgeSent(id);
       parts.push(`Haven't heard from ${names.join(", ")}. Worth calling on them next.`);
+    }
+    if (tally.unsureStudents.length > 0) {
+      const names = tally.unsureStudents.map((id) => this.displayNameFor(id));
+      parts.push(`Not sure: ${names.join(", ")}. They said they were not sure; worth reaching them first.`);
     }
     if (tally.incorrectAnswers.length > 0) {
       const lines = tally.incorrectAnswers.map(
@@ -310,16 +410,19 @@ export class SessionManager {
       );
       parts.push(`Not correct: ${lines.join("; ")}.`);
     }
-    await this.dmTeacher(parts.length > 0 ? parts.join(" ") : "Everyone answered that one.");
+    const prefix = tally.label ? `Question ${tally.label.slice(1)}: ` : "";
+    await this.dmTeacher(parts.length > 0 ? prefix + parts.join(" ") : `${prefix}Everyone answered that one.`);
   }
 
-  /** Periodic tick (server calls every ~15s): close an expired answer
-   *  round (one combined report to the teacher) and send silence nudges. */
+  /** Periodic tick (server calls every ~15s): close any expired answer
+   *  rounds (one combined report per round to the teacher) and send
+   *  silence nudges. */
   async tick(): Promise<void> {
     const now = Date.now();
-    const active = this.checkIns.active;
-    if (active && active.closedAt === null && now - active.openedAt > active.windowMs) {
-      await this.closeRound(now);
+    for (const round of this.checkIns.roundsSnapshot()) {
+      if (round.closedAt === null && now - round.openedAt > round.windowMs) {
+        await this.closeRound(round.label, now);
+      }
     }
 
     const segment = now - this.startedAt < DEFAULT_CLASS_DURATION_MS / 2 ? "early" : "late";

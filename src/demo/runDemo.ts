@@ -18,6 +18,7 @@ import type { SessionContext } from "../types.js";
 import type { VisionProvider } from "../brain/Vision.js";
 import { MockBotProvider } from "./mockBot.js";
 import { StubPlatform } from "./stubPlatform.js";
+import { answersMatch } from "../brain/CheckInEngine.js";
 
 const DEMO_SECRET = "demo-secret-not-a-real-credential";
 const MIN = 60 * 1000;
@@ -396,8 +397,8 @@ async function main(): Promise<void> {
     cb.chat?.on_bot_join?.send_to === "everyone" && cb.chat?.on_bot_join?.pin === true && cb.chat?.on_bot_join?.message === JOIN_ANNOUNCEMENT,
   );
   check(
-    "create body: announcement re-sent on participant join",
-    cb.chat?.on_participant_join?.send_to === "everyone" && cb.chat?.on_participant_join?.message === JOIN_ANNOUNCEMENT,
+    "create body: NO on_participant_join message (the assistant never DMs a student unprompted)",
+    cb.chat?.on_participant_join === undefined,
   );
   check(
     "create body: recallai_streaming transcript, low-latency mode",
@@ -585,8 +586,8 @@ async function main(): Promise<void> {
   const bot9 = new MockBotProvider(trace);
   bot9.screenFrame = { pngBase64: "FAKEPNG", participantName: "Ms Rose Clarke", isScreenshare: true, capturedAt: fakeNow };
   const fakeVision: VisionProvider = {
-    async readQuestion() {
-      return { questionText: "What is x if 2x + 3 = 17?", workedAnswer: "7", legible: true };
+    async readScreen() {
+      return [{ label: "", questionText: "What is x if 2x + 3 = 17?", workedAnswer: "7", legible: true }];
     },
     async makeHint() {
       return "Check what happens to the +3 when it crosses the equals sign.";
@@ -642,6 +643,116 @@ async function main(): Promise<void> {
   await bot9.emit({ type: "bot_status", status: "call_ended" });
   const p9 = stub.received.find((p) => p.session_id === SESSION_6);
   check("scenario 9 payload reached the stub", !!p9);
+
+  // ================================================================
+  heading("SCENARIO 10: Nov 5 findings: teacher by name, per-question time, labelled rounds, unsure, matcher");
+  // ================================================================
+  const SESSION_7 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  fakeNow = Date.parse("2026-11-05T16:00:00.000Z");
+
+  // Answer-matcher units (the correct-after-hint fix).
+  check("matcher: algebraic term order does not matter", answersMatch("3a + 5b", "5b + 3a"));
+  check("matcher: percent sign tolerated", answersMatch("36", "36%"));
+  check("matcher: fraction equals decimal", answersMatch("1/2", "0.5"));
+  check("matcher: thousands separator tolerated", answersMatch("1000", "1,000"));
+  check("matcher: currency tolerated", answersMatch("250", "$250"));
+  check("matcher: genuinely different answers still fail", !answersMatch("8", "7"));
+  check("matcher: different algebra still fails", !answersMatch("3a + 5b", "3a + 2b"));
+
+  const bot10 = new MockBotProvider(trace);
+  const ctx10: SessionContext = {
+    sessionId: SESSION_7,
+    cohortId: COHORT,
+    meetingUrl: "https://zoom.us/j/00000000000",
+    joinAt: new Date(fakeNow).toISOString(),
+    teacherParticipantId: null,
+    teacherNames: ["Renee Rose"],
+    teacherLabel: "Miss Rose",
+    roster: roster().slice(0, 3), // Amara, Devonte, Kezia
+  };
+  const mgr10 = new SessionManager(ctx10, bot10, platform);
+  bot10.onEvent((botId, ev) => mgr10.handleEvent(botId, ev));
+  await mgr10.start();
+  await bot10.emit({ type: "bot_status", status: "in_call" });
+  // The teacher joins NOT flagged as host (her own account quirk); her
+  // NAME must still make her the teacher.
+  await bot10.emit({ type: "participant_joined", participantId: "p-renee", name: "Renee Rose", isHost: false });
+  await bot10.emit({ type: "participant_joined", participantId: "p-amara", name: "Amara Reid", isHost: false });
+  await bot10.emit({ type: "participant_joined", participantId: "p-devonte", name: "Devonte Cole", isHost: false });
+  await bot10.emit({ type: "participant_joined", participantId: "p-kezia", name: "Kezia Brown", isHost: false });
+
+  // Microphone and public chat participation, for the report checks.
+  await bot10.emit({ type: "transcript", participantId: "p-amara", name: "Amara Reid", text: "Miss, is it the 3 we move first?", timestamp: fakeNow });
+  await bot10.emit({ type: "chat_message", participantId: "p-devonte", name: "Devonte Cole", to: "everyone", text: "I am following so far", timestamp: fakeNow });
+
+  // Two labelled questions open at once; the first carries its own window.
+  await bot10.emit({ type: "chat_message", participantId: "p-renee", name: "Renee Rose", to: "bot", text: "ANSWER | 7 | mode: hint | time: 5 | Q1", timestamp: fakeNow });
+  check(
+    "teacher recognised by name: her command opened Question 1 with a 5 minute window",
+    bot10.sent.some(
+      (m) => m.toParticipantId === "p-renee" && m.message.includes("Question 1") && m.message.includes("Window: 5 minutes"),
+    ),
+    bot10.sent.filter((m) => m.toParticipantId === "p-renee").map((m) => m.message).join(" | "),
+  );
+  await bot10.emit({ type: "chat_message", participantId: "p-renee", name: "Renee Rose", to: "bot", text: "ANSWER | 36 | mode: hint | Q2", timestamp: fakeNow });
+  check(
+    "second labelled round opened alongside the first",
+    bot10.sent.some((m) => m.toParticipantId === "p-renee" && m.message.includes("Question 2")),
+  );
+
+  // Amara: wrong, then right on the retry, labelled both times.
+  await bot10.emit({ type: "chat_message", participantId: "p-amara", name: "Amara Reid", to: "bot", text: "Q1: 5", timestamp: fakeNow });
+  await bot10.emit({ type: "chat_message", participantId: "p-amara", name: "Amara Reid", to: "bot", text: "Q1: x = 7", timestamp: fakeNow });
+  check(
+    "correct answer after a hint counts (label + 'x =' forms accepted)",
+    bot10.sent.some((m) => m.toParticipantId === "p-amara" && /correct|that's it/i.test(m.message)),
+  );
+
+  // Devonte's bare answer is ambiguous across two open rounds.
+  await bot10.emit({ type: "chat_message", participantId: "p-devonte", name: "Devonte Cole", to: "bot", text: "36", timestamp: fakeNow });
+  check(
+    "bare answer across two open rounds asks for the question number",
+    bot10.sent.some((m) => m.toParticipantId === "p-devonte" && m.message.includes("more than one question")),
+  );
+  await bot10.emit({ type: "chat_message", participantId: "p-devonte", name: "Devonte Cole", to: "bot", text: "Q2: 36%", timestamp: fakeNow });
+  check(
+    "labelled answer with a percent sign scores correct",
+    bot10.sent.some((m) => m.toParticipantId === "p-devonte" && /correct|right|got it/i.test(m.message)),
+  );
+
+  // Kezia is honest instead of guessing: never scored incorrect.
+  await bot10.emit({ type: "chat_message", participantId: "p-kezia", name: "Kezia Brown", to: "bot", text: "Q1: I don't know", timestamp: fakeNow });
+  check(
+    "unsure student gets a compassionate reply, not a wrong mark",
+    bot10.sent.some(
+      (m) => m.toParticipantId === "p-kezia" && /okay|no worries|thanks for saying/i.test(m.message),
+    ),
+  );
+
+  // Devonte completes Question 1, closing it; the teacher's private
+  // report names Kezia as not sure, and nobody is called incorrect.
+  await bot10.emit({ type: "chat_message", participantId: "p-devonte", name: "Devonte Cole", to: "bot", text: "Q1: 7", timestamp: fakeNow });
+  const closeDms = bot10.sent.filter((m) => m.toParticipantId === "p-renee" && m.message.startsWith("Question 1:"));
+  check(
+    "Question 1 close-out is private to the teacher and lists the unsure student",
+    closeDms.some((m) => m.message.includes("Not sure: Kezia Brown")),
+    closeDms.map((m) => m.message).join(" | "),
+  );
+  check(
+    "no student was publicly named in any close-out",
+    !bot10.sent.some((m) => m.toParticipantId === null && /Not correct|Haven't heard|Not sure/.test(m.message)),
+  );
+
+  await bot10.emit({ type: "bot_status", status: "call_ended" });
+  const p10 = stub.received.find((p) => p.session_id === SESSION_7);
+  check("scenario 10 payload reached the stub", !!p10);
+  if (p10) {
+    const evAmara = p10.entries.find((e) => e.student_id === AMARA)?.evidence;
+    const evDevonte = p10.entries.find((e) => e.student_id === DEVONTE)?.evidence;
+    check("report capture: microphone turns recorded", (evAmara?.speaking_turns ?? 0) >= 1, JSON.stringify(evAmara));
+    check("report capture: public chat recorded", (evDevonte?.chat_public ?? 0) >= 1, JSON.stringify(evDevonte));
+    check("report capture: assistant answers recorded across rounds", (evDevonte?.checkins_answered ?? 0) >= 2, JSON.stringify(evDevonte));
+  }
 
   await stub.stop();
   heading("RESULT");

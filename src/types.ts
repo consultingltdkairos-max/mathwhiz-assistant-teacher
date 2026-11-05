@@ -13,6 +13,15 @@ export interface SessionContext {
   meetingUrl: string; // Zoom join URL from class_sessions.zoom_join_url
   joinAt: string; // ISO8601, a few minutes before scheduled start
   teacherParticipantId: string | null; // Recall participant id of the host/teacher once seen
+  /** Display names the class teacher may join under (Nov 5, 2026
+   *  finding): the teacher is recognised by host status OR by matching
+   *  one of these names, so a teacher on her own host account is
+   *  recognised even when Zoom does not flag her as host in the event
+   *  stream, or she joins under a slightly different display name. */
+  teacherNames?: string[];
+  /** How the assistant should refer to the teacher to students (for
+   *  example "Miss Rose"). Defaults to the name she joined under. */
+  teacherLabel?: string;
   roster: RosterStudent[];
 }
 
@@ -81,10 +90,17 @@ export type CheckInOutcome =
   | "hint_pending"
   | "correct"
   | "correct_with_hint"
-  | "incorrect";
+  | "incorrect"
+  /** The student said they do not know / are not sure (Nov 5, 2026
+   *  finding). A final outcome, reported to the teacher separately from
+   *  incorrect: they engaged, they were honest, they need the teacher. */
+  | "unsure";
 
 export interface CheckIn {
   id: string;
+  /** Round label for multi-question boards: "Q1", "Q2", ... Empty
+   *  string for a single unlabelled round (the original model). */
+  label: string;
   /** The teacher's expected answer for this round. There is deliberately
    *  no question field: the question lives on the teacher's board and is
    *  never held or relayed by the bot (correction, 27 Oct 2026). */

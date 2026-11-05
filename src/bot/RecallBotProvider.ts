@@ -100,11 +100,13 @@ export class RecallBotProvider implements BotProvider {
       bot_name: req.botName,
       metadata: { session_id: req.sessionId, source: "assistant_teacher_v1" },
       chat: {
-        // Public announcement when the bot joins.
+        // Public announcement when the bot joins. That is the ONLY
+        // unprompted message the bot ever sends (compliance ruling,
+        // Nov 5, 2026): there is deliberately NO on_participant_join
+        // message, because on Zoom those are delivered as DMs, and the
+        // assistant never privately contacts a student who has not
+        // messaged it first.
         on_bot_join: { send_to: "everyone", message: req.joinAnnouncement, pin: true },
-        // Re-sent as each participant joins, so late joiners see it too.
-        // (On Zoom, on_participant_join messages are delivered as DMs.)
-        on_participant_join: { send_to: "everyone", message: req.joinAnnouncement, exclude_host: true },
       },
       recording_config: {
         transcript: { provider: transcriptProvider },
