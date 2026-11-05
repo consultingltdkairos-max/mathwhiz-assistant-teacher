@@ -15,6 +15,7 @@ import { RecallBotProvider, type FetchImpl } from "../bot/RecallBotProvider.js";
 import { JOIN_ANNOUNCEMENT, SessionManager } from "../brain/SessionManager.js";
 import type { ServiceConfig } from "../config.js";
 import type { SessionContext } from "../types.js";
+import type { VisionProvider } from "../brain/Vision.js";
 import { MockBotProvider } from "./mockBot.js";
 import { StubPlatform } from "./stubPlatform.js";
 
@@ -65,6 +66,7 @@ function makeConfig(stubUrl: string): ServiceConfig {
     publicBaseUrl: "http://127.0.0.1",
     botDisplayName: "Assistant Teacher (AI)",
     transcriptProvider: "recallai_streaming",
+    screen: { enabled: false, visionApiKey: null, visionModel: "demo-model" },
     recall: { apiKey: "unused-in-demo", region: "us-west-2", webhookSecret: "unused-in-demo", realtimeMode: "webhook" },
     platform: { baseUrl: stubUrl, assistantSecret: DEMO_SECRET },
   };
@@ -187,10 +189,10 @@ async function main(): Promise<void> {
     check("Shanice flagged in data gaps, not guessed", shanice.data_gaps.length >= 2, shanice.data_gaps.join(" ; "));
   }
   const out = bot1.sent;
-  check("hint DM went to Devonte", out.some((m) => m.kind === "dm" && m.toParticipantId === "p-devonte" && m.message.startsWith("Not quite")));
-  check("correct-with-hint reply DM went to Devonte", out.some((m) => m.kind === "dm" && m.toParticipantId === "p-devonte" && m.message.includes("with the hint")));
+  check("retry invitation DM went to Devonte (no step hint)", out.some((m) => m.kind === "dm" && m.toParticipantId === "p-devonte" && (m.message.startsWith("Not quite") || m.message.startsWith("Close.") || m.message.startsWith("Good effort")) && !m.message.includes("equals sign")));
+  check("correct-on-retry reply DM went to Devonte", out.some((m) => m.kind === "dm" && m.toParticipantId === "p-devonte" && /correct|that's it now/i.test(m.message)));
   check("extra reply from Devonte got the already-answered reply", out.some((m) => m.kind === "dm" && m.toParticipantId === "p-devonte" && m.message.includes("already have your answer")));
-  check("correct reply DM went to Amara", out.some((m) => m.kind === "dm" && m.toParticipantId === "p-amara" && (m.message.startsWith("Yes") || m.message.startsWith("Correct"))));
+  check("correct reply DM went to Amara", out.some((m) => m.kind === "dm" && m.toParticipantId === "p-amara" && (m.message.startsWith("Yes") || m.message.startsWith("Correct") || m.message.startsWith("Awesome") || m.message.startsWith("You got it") || m.message.startsWith("Exactly"))));
   check("round-close DM names the one non-responder (Kezia)", out.some((m) => m.toParticipantId === "p-teacher" && m.message === "Haven't heard from Kezia Brown. Worth calling on them next."));
   check(
     "no question was ever sent to a student (answer-only model)",
@@ -315,8 +317,8 @@ async function main(): Promise<void> {
     check("Devonte answered = 1 (hint taken, no retry, settles incorrect)", d4.evidence.checkins_answered === 1);
   }
   const out4 = bot4.sent;
-  check("both answered, so the close DM is the all-answered one", out4.some((m) => m.toParticipantId === "p-teacher" && m.message === "Everyone answered that one."));
-  check("wrong retry closed the question for Amara", out4.some((m) => m.toParticipantId === "p-amara" && m.message.includes("closes this check in")));
+  check("close DM lists BOTH incorrect students with the answers they sent (Nov 5 ruling)", out4.some((m) => m.toParticipantId === "p-teacher" && m.message === "Not correct: Amara Reid sent \"x = 5\"; Devonte Cole sent \"x = 3\"."));
+  check("wrong retry got the wait-for-correction reply naming the teacher", out4.some((m) => m.toParticipantId === "p-amara" && m.message.includes("Ms Rose Clarke") && m.message.includes("correction")));
   check("third reply got the already-answered reply", out4.some((m) => m.toParticipantId === "p-amara" && m.message.includes("already have your answer")));
   check("no non-responder DM for Amara or Devonte", !out4.some((m) => m.toParticipantId === "p-teacher" && (m.message.includes("Haven't heard from Amara") || m.message.includes("Haven't heard from Devonte"))));
 
@@ -363,6 +365,7 @@ async function main(): Promise<void> {
     publicBaseUrl: "https://brain.example.test",
     botDisplayName: "Assistant Teacher (AI)",
     transcriptProvider: "recallai_streaming",
+    screen: { enabled: false, visionApiKey: null, visionModel: "demo-model" },
     recall: { apiKey: DUMMY_KEY, region: "us-west-2", webhookSecret: "unused-in-demo", realtimeMode: "webhook" },
     platform: { baseUrl: stubUrl, assistantSecret: DEMO_SECRET },
   };
@@ -543,7 +546,7 @@ async function main(): Promise<void> {
   );
   check("all-answered DM sent once, on the early close", out7.filter((m) => m.toParticipantId === "p-teacher" && m.message === "Everyone answered that one.").length === 1);
   check("no per-student non-response nudges remain", !out7.some((m) => m.message.includes("in this check in yet")));
-  check("Devonte's hint and correct-with-hint replies still work in answer rounds", out7.some((m) => m.toParticipantId === "p-devonte" && m.message.startsWith("Not quite")) && out7.some((m) => m.toParticipantId === "p-devonte" && m.message.includes("with the hint")));
+  check("Devonte's retry invitation and correct-on-retry replies still work in answer rounds", out7.some((m) => m.toParticipantId === "p-devonte" && (m.message.startsWith("Not quite") || m.message.startsWith("Close.") || m.message.startsWith("Good effort"))) && out7.some((m) => m.toParticipantId === "p-devonte" && /correct|that's it now/i.test(m.message)));
   const p7 = stub.received.find((p) => p.session_id === SESSION_4);
   check("scenario 7 payload reached the stub", !!p7);
   if (p7) {
@@ -573,6 +576,72 @@ async function main(): Promise<void> {
   check("draft recorded even though the platform post failed", mgr8.recordedDraft !== null && mgr8.recordedDraft.session_id === SESSION_5);
   check("recorded draft carries its entries", (mgr8.recordedDraft?.entries.length ?? 0) === 1);
   check("failed post reached no stub", !stub.received.some((p) => p.session_id === SESSION_5));
+
+  // ================================================================
+  heading("SCENARIO 9: screen reading, cross-check, real hints, contextual help (Nov 5, 2026)");
+  // ================================================================
+  const SESSION_6 = "66666666-6666-4666-8666-666666666666";
+  fakeNow = Date.parse("2026-11-05T15:00:00.000Z");
+  const bot9 = new MockBotProvider(trace);
+  bot9.screenFrame = { pngBase64: "FAKEPNG", participantName: "Ms Rose Clarke", isScreenshare: true, capturedAt: fakeNow };
+  const fakeVision: VisionProvider = {
+    async readQuestion() {
+      return { questionText: "What is x if 2x + 3 = 17?", workedAnswer: "7", legible: true };
+    },
+    async makeHint() {
+      return "Check what happens to the +3 when it crosses the equals sign.";
+    },
+    async helpWithQuestion() {
+      return "Start by getting x on its own: move the +3 across first, then undo the times 2.";
+    },
+  };
+  const ctx9: SessionContext = {
+    sessionId: SESSION_6,
+    cohortId: COHORT,
+    meetingUrl: "https://zoom.us/j/00000000000",
+    joinAt: new Date(fakeNow).toISOString(),
+    teacherParticipantId: null,
+    roster: roster().slice(0, 1), // Amara only
+  };
+  const mgr9 = new SessionManager(ctx9, bot9, platform, fakeVision);
+  bot9.onEvent((botId, ev) => mgr9.handleEvent(botId, ev));
+  await mgr9.start();
+  await bot9.emit({ type: "bot_status", status: "in_call" });
+  await bot9.emit({ type: "participant_joined", participantId: "p-teacher", name: "Ms Rose Clarke", isHost: true });
+  await bot9.emit({ type: "participant_joined", participantId: "p-amara", name: "Amara Reid", isHost: false });
+
+  // The teacher opens a round with a MISTYPED expected answer (8; the
+  // screen question works out to 7). Scoring still uses the teacher's
+  // answer, but the cross-check must warn her privately.
+  await bot9.emit({ type: "chat_message", participantId: "p-teacher", name: "Ms Rose Clarke", to: "bot", text: "ANSWER | 8 | mode: hint", timestamp: fakeNow });
+  await new Promise((r) => setTimeout(r, 25)); // the screen read runs in the background by design
+  const out9a = bot9.sent;
+  check(
+    "cross-check DM warns the teacher the screen answer disagrees",
+    out9a.some((m) => m.toParticipantId === "p-teacher" && m.message.includes("works out to 7") && m.message.includes("Your round answer is 8")),
+  );
+
+  // Amara answers wrong; with the screen question known she gets the
+  // REAL hint, not a pool line.
+  await bot9.emit({ type: "chat_message", participantId: "p-amara", name: "Amara Reid", to: "bot", text: "5", timestamp: fakeNow });
+  check(
+    "wrong answer earned the vision hint written against the screen question",
+    bot9.sent.some((m) => m.toParticipantId === "p-amara" && m.message === "Check what happens to the +3 when it crosses the equals sign."),
+  );
+
+  // Retry with the teacher's expected value closes the round.
+  await bot9.emit({ type: "chat_message", participantId: "p-amara", name: "Amara Reid", to: "bot", text: "8", timestamp: fakeNow });
+
+  // After the round, a stuck student gets help written against the
+  // actual question on screen.
+  await bot9.emit({ type: "chat_message", participantId: "p-amara", name: "Amara Reid", to: "bot", text: "I don't get it", timestamp: fakeNow });
+  check(
+    "student help used the screen question context",
+    bot9.sent.some((m) => m.toParticipantId === "p-amara" && m.message === "Start by getting x on its own: move the +3 across first, then undo the times 2."),
+  );
+  await bot9.emit({ type: "bot_status", status: "call_ended" });
+  const p9 = stub.received.find((p) => p.session_id === SESSION_6);
+  check("scenario 9 payload reached the stub", !!p9);
 
   await stub.stop();
   heading("RESULT");

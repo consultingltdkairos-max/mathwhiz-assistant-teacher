@@ -13,6 +13,7 @@ const cfg: ServiceConfig = {
   publicBaseUrl: "https://example.invalid",
   botDisplayName: "Assistant Teacher (AI)",
   transcriptProvider: "recallai_streaming",
+    screen: { enabled: false, visionApiKey: null, visionModel: "demo-model" },
   recall: { apiKey: "test", region: "us-west-2", webhookSecret: "whsec_test", realtimeMode: "webhook" },
   platform: { baseUrl: "https://example.invalid", assistantSecret: "test" },
 };

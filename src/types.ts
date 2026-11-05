@@ -95,4 +95,8 @@ export interface CheckIn {
   closedAt: number | null;
   /** studentId -> outcome/state */
   results: Map<string, CheckInOutcome>;
+  /** studentId -> the wrong answer text they most recently sent, kept so
+   *  the teacher's close-out report can show what each incorrect student
+   *  actually sent (Kevoy ruling, Nov 5, 2026). */
+  wrongAnswers: Map<string, string>;
 }

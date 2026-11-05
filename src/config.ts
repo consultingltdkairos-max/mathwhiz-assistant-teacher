@@ -62,6 +62,15 @@ export interface ServiceConfig {
   publicBaseUrl: string; // public URL of this service, used as the Recall realtime webhook target
   botDisplayName: string;
   transcriptProvider: "recallai_streaming" | "meeting_captions";
+  /** Screen-question reading (Nov 5, 2026). enabled: subscribe the bot
+   *  to live video frames so the brain can read the shared screen.
+   *  visionApiKey: when null, every screen feature falls back silently
+   *  to the rule-based behaviour; nothing breaks without it. */
+  screen: {
+    enabled: boolean;
+    visionApiKey: string | null;
+    visionModel: string;
+  };
   recall: {
     apiKey: string;
     region: string; // Recall workspace region; Mathwhiz workspace is "us-west-2"
@@ -90,6 +99,11 @@ export function loadConfig(): ServiceConfig {
     transcriptProvider:
       (process.env.TRANSCRIPT_PROVIDER as ServiceConfig["transcriptProvider"]) ??
       "recallai_streaming",
+    screen: {
+      enabled: process.env.SCREEN_VIDEO_ENABLED === "1",
+      visionApiKey: process.env.ANTHROPIC_API_KEY ?? null,
+      visionModel: process.env.VISION_MODEL ?? "claude-haiku-4-5",
+    },
     recall: {
       apiKey: required("RECALL_API_KEY"),
       region: process.env.RECALL_REGION ?? "us-west-2",

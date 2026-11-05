@@ -2,6 +2,7 @@
   "description": "Brain service for the Mathwhiz AI Assistant Teacher pilot (Recall.ai bot layer). Includes a fully local end-to-end demo (npm run demo): mock Recall harness + stub platform, no external calls.",
   "devDependencies": {
     "@types/node": "^20.11.0",
+    "@types/ws": "^8.18.2",
     "tsx": "^4.7.0",
     "typescript": "^5.3.0"
   },
@@ -17,5 +18,8 @@
     "bot:create-test": "tsx src/scripts/createTestBot.ts"
   },
   "type": "module",
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "dependencies": {
+    "ws": "^8.22.1"
+  }
 }

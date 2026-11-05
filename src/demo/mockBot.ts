@@ -28,6 +28,12 @@ export class MockBotProvider implements BotProvider {
   private handler: BotEventHandler | null = null;
   private botId = "mock-bot-0001";
   private seq = 0;
+  /** Set by a scenario to simulate a screenshare frame being available. */
+  screenFrame: import("../bot/BotProvider.js").ScreenFrame | null = null;
+
+  async getScreenFrame(): Promise<import("../bot/BotProvider.js").ScreenFrame | null> {
+    return this.screenFrame;
+  }
 
   constructor(private trace: (line: string) => void) {}
 

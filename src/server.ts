@@ -1,20 +1,28 @@
 // HTTP surface of the brain service.
 //   POST /recall/webhook       Recall realtime + bot status webhooks (signed)
+//   WS   /recall/video         Recall realtime video frames (screen reading)
 //   POST /admin/start-session  dispatch the bot for a platform session
 //   POST /admin/end-session    finalise a session now (compile + post draft)
 // Admin routes are for Ben/the scheduler only; protect them at the host
 // layer (private network or a shared admin token, TODO before any deploy).
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { WebSocketServer } from "ws";
 import type { ServiceConfig } from "./config.js";
 import { RecallBotProvider } from "./bot/RecallBotProvider.js";
 import { PlatformClient } from "./platform/PlatformClient.js";
 import { SessionManager } from "./brain/SessionManager.js";
+import { AnthropicVisionProvider } from "./brain/Vision.js";
 import type { SessionContext } from "./types.js";
 
 export function startServer(cfg: ServiceConfig): void {
   const bot = new RecallBotProvider(cfg);
   const platform = new PlatformClient(cfg);
+  // Screen vision is live only when an API key is configured; without it
+  // every screen feature falls back silently (see Vision.ts).
+  const vision = cfg.screen.visionApiKey
+    ? new AnthropicVisionProvider(cfg.screen.visionApiKey, cfg.screen.visionModel)
+    : null;
   const sessions = new Map<string, SessionManager>(); // botId -> manager
   const bySession = new Map<string, SessionManager>(); // sessionId -> manager
 
@@ -49,7 +57,7 @@ export function startServer(cfg: ServiceConfig): void {
 
       if (req.method === "POST" && url.pathname === "/admin/start-session") {
         const ctx = JSON.parse(raw) as SessionContext;
-        const mgr = new SessionManager(ctx, bot, platform);
+        const mgr = new SessionManager(ctx, bot, platform, vision);
         bySession.set(ctx.sessionId, mgr);
         await mgr.start();
         // Register the botId -> manager mapping so this bot's webhook
@@ -78,6 +86,23 @@ export function startServer(cfg: ServiceConfig): void {
       console.error(err);
       return json(res, 500, { error: "internal error" });
     }
+  });
+
+  // Realtime video websocket (screen reading). Recall connects OUT to
+  // this endpoint per bot, with ?session=<sessionId> in the URL set at
+  // Create Bot time. Frames land in the provider's in-memory store.
+  const wss = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (req, socket, head) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    if (url.pathname !== "/recall/video") {
+      socket.destroy();
+      return;
+    }
+    const session = url.searchParams.get("session") ?? "";
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.on("message", (data) => bot.handleVideoMessage(session, data.toString()));
+      ws.on("error", () => undefined);
+    });
   });
 
   server.listen(cfg.port, () => {

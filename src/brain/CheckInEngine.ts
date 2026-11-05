@@ -14,10 +14,21 @@
 // or confirming that everyone answered.
 //
 // Scoring: one scored first reply per student. In hint mode a wrong
-// first reply earns a hint and exactly ONE scored retry (correct on the
-// retry is "correct_with_hint", never a first-try "correct"; wrong on
-// the retry closes the question). Confirm mode has no retry. Any
-// further reply is consumed but ignored for scoring.
+// first reply earns exactly ONE scored retry (correct on the retry is
+// "correct_with_hint", never a first-try "correct"; wrong on the retry
+// closes the question). Confirm mode has no retry. Any further reply is
+// consumed but ignored for scoring.
+//
+// Replies (Kevoy ruling, Nov 5, 2026, after the Stage 0 live test):
+// there is NO step hint. The bot never sees the question, so a hint that
+// names a step is a guess and can be wrong for the actual question.
+// Instead the student replies are conversational and varied: correct
+// answers get one of a pool of praise lines; a wrong first reply in
+// hint mode gets a short "not quite, one more try" line; a final wrong
+// answer gets a line that tells the student to hold on for the
+// teacher's full correction. The teacher command stays a one-line
+// template where only the answer changes, so opening a round costs the
+// teacher seconds while teaching.
 //
 // Liberal parsing, strict behaviour: the legacy CHECKIN format
 // (CHECKIN | question | expected answer | mode: ...) is still accepted
@@ -96,9 +107,49 @@ export type CheckInReplyResult =
       replyText: string;
     };
 
+const pick = (pool: string[]): string => pool[Math.floor(Math.random() * pool.length)];
+
+const PRAISE: string[] = [
+  "Yes, correct. Well done.",
+  "Correct, nice work.",
+  "Yes, that's right.",
+  "Awesome job, that's correct.",
+  "You got it. Well done.",
+  "Exactly right, great work.",
+];
+
+const RETRY: string[] = [
+  "Not quite, but give it one more try.",
+  "Close. Have another go.",
+  "Not quite yet, try once more.",
+  "Good effort, take one more try.",
+];
+
+const RETRY_SUCCESS: string[] = [
+  "There you go, correct now. Well done.",
+  "Yes, that's it now. Good persistence.",
+  "Correct on the second go, nice work.",
+];
+
 export class CheckInEngine {
   private current: CheckIn | null = null;
   private seq = 0;
+  /** The teacher's display name, for the "wait for the full correction"
+   *  reply. Set by the session manager when the host joins. */
+  private teacherLabel: string | null = null;
+
+  setTeacherLabel(name: string | null): void {
+    this.teacherLabel = name && name.trim() ? name.trim() : null;
+  }
+
+  private finalWrongReply(): string {
+    const t = this.teacherLabel ?? "your teacher";
+    return pick([
+      `Not quite. Hold on, ${t} will go over the full correction shortly.`,
+      `Not this time. Sit tight, ${t} will go through the correction in a moment.`,
+      `Not quite. Keep your working there, ${t} will work through the correction with the class.`,
+    ]);
+  }
 
   open(cmd: ParsedRoundCommand, studentIds: string[], now: number): CheckIn {
     this.seq += 1;
@@ -110,6 +161,7 @@ export class CheckInEngine {
       openedAt: now,
       closedAt: null,
       results: new Map(studentIds.map((id) => [id, "no_response" as const])),
+      wrongAnswers: new Map(),
     };
     return this.current;
   }
@@ -141,50 +193,32 @@ export class CheckInEngine {
       const correct = answersMatch(c.expectedAnswer, text);
       if (correct) {
         c.results.set(studentId, "correct");
-        const praise = ["Yes, correct. Well done.", "Correct, nice work.", "Yes, that's right."];
-        return {
-          kind: "scored",
-          attempt: "first",
-          correct: true,
-          replyText: praise[Math.floor(Math.random() * praise.length)],
-        };
+        return { kind: "scored", attempt: "first", correct: true, replyText: pick(PRAISE) };
       }
+      // Wrong: remember what they actually sent, for the teacher's
+      // close-out report.
+      c.wrongAnswers.set(studentId, text.trim());
       if (c.mode === "hint") {
-        // One hint aimed at the step, never the answer itself, and the
-        // student moves to "hint_pending": exactly one scored retry.
-        // TODO: hint text comes from a per-question hint the teacher may add
-        // to the command; until then a generic step hint is used.
+        // No step hint (Nov 5, 2026 ruling): a short retry invitation,
+        // and the student moves to "hint_pending": exactly one scored
+        // retry. The state name is kept from the earlier hint design.
         c.results.set(studentId, "hint_pending");
-        return {
-          kind: "scored",
-          attempt: "first",
-          correct: false,
-          replyText:
-            "Not quite. Recheck the step where you move the number across the equals sign, then try once more.",
-        };
+        return { kind: "scored", attempt: "first", correct: false, replyText: pick(RETRY) };
       }
       c.results.set(studentId, "incorrect");
-      return { kind: "scored", attempt: "first", correct: false, replyText: "Not quite, thanks for trying." };
+      return { kind: "scored", attempt: "first", correct: false, replyText: this.finalWrongReply() };
     }
 
     if (state === "hint_pending") {
       const correct = answersMatch(c.expectedAnswer, text);
       if (correct) {
         c.results.set(studentId, "correct_with_hint");
-        return {
-          kind: "scored",
-          attempt: "retry",
-          correct: true,
-          replyText: "Correct, you got it with the hint. Well done.",
-        };
+        c.wrongAnswers.delete(studentId);
+        return { kind: "scored", attempt: "retry", correct: true, replyText: pick(RETRY_SUCCESS) };
       }
       c.results.set(studentId, "incorrect");
-      return {
-        kind: "scored",
-        attempt: "retry",
-        correct: false,
-        replyText: "Not quite, but good try. That closes this check in for you.",
-      };
+      c.wrongAnswers.set(studentId, text.trim());
+      return { kind: "scored", attempt: "retry", correct: false, replyText: this.finalWrongReply() };
     }
 
     // "correct" | "correct_with_hint" | "incorrect": outcome is final.
@@ -197,14 +231,21 @@ export class CheckInEngine {
     return [...this.current.results.entries()].filter(([, v]) => v === "no_response").map(([k]) => k);
   }
 
-  close(
-    now: number,
-  ): { answered: number; correct: number; correctWithHint: number; nonResponders: string[] } | null {
+  close(now: number): {
+    answered: number;
+    correct: number;
+    correctWithHint: number;
+    nonResponders: string[];
+    /** Final-incorrect students with the answer text they sent, for the
+     *  teacher's close-out report (Kevoy ruling, Nov 5, 2026). */
+    incorrectAnswers: { studentId: string; answer: string }[];
+  } | null {
     const c = this.current;
     if (!c || c.closedAt !== null) return null;
     c.closedAt = now;
-    // A student who took the hint but never retried answered incorrectly;
-    // settle the working state so the results map holds final outcomes only.
+    // A student who took the retry invitation but never retried answered
+    // incorrectly; settle the working state so the results map holds
+    // final outcomes only.
     for (const [id, v] of c.results) {
       if (v === "hint_pending") c.results.set(id, "incorrect");
     }
@@ -214,6 +255,9 @@ export class CheckInEngine {
       correct: values.filter((v) => v === "correct").length,
       correctWithHint: values.filter((v) => v === "correct_with_hint").length,
       nonResponders: this.nonResponders(),
+      incorrectAnswers: [...c.results.entries()]
+        .filter(([, v]) => v === "incorrect")
+        .map(([id]) => ({ studentId: id, answer: c.wrongAnswers.get(id) ?? "" })),
     };
   }
 

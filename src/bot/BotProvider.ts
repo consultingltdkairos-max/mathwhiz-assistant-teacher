@@ -42,9 +42,25 @@ export interface CreateBotRequest {
   joinAnnouncement: string; // sent publicly on join (and re-sent per join where supported)
 }
 
+/** One still frame of what the bot can see in the meeting, used by the
+ *  screen-question reader (Nov 5, 2026). Frames are processed in memory
+ *  and discarded; they are never stored by the brain. */
+export interface ScreenFrame {
+  pngBase64: string;
+  /** Display name of the participant whose stream this frame came from. */
+  participantName: string;
+  /** True when the provider flags this stream as a screenshare. */
+  isScreenshare: boolean;
+  capturedAt: number; // epoch ms
+}
+
 export interface BotProvider {
   /** Create and schedule a bot for a session. Returns the provider bot id. */
   createBot(req: CreateBotRequest): Promise<BotSession>;
+  /** The freshest screenshare frame the bot has received, or null when
+   *  no frame is available (feature off, nobody sharing, not yet arrived).
+   *  Implementations must never fabricate a frame. */
+  getScreenFrame(botId: string): Promise<ScreenFrame | null>;
   /** Send a public chat message to everyone in the meeting. */
   sendPublicMessage(botId: string, message: string): Promise<void>;
   /** Send a DM to one participant (student replies, teacher nudges). */

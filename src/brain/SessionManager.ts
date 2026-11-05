@@ -4,7 +4,8 @@
 import type { BotEvent, BotProvider } from "../bot/BotProvider.js";
 import type { PlatformClient } from "../platform/PlatformClient.js";
 import type { ParticipationDraftPayload, SessionContext } from "../types.js";
-import { CheckInEngine, parseRoundCommand } from "./CheckInEngine.js";
+import { CheckInEngine, answersMatch, parseRoundCommand } from "./CheckInEngine.js";
+import type { ScreenQuestion, VisionProvider } from "./Vision.js";
 import { compileDraft } from "./Compiler.js";
 import { NudgeEngine } from "./NudgeEngine.js";
 import { RosterMatcher } from "./RosterMatcher.js";
@@ -37,10 +38,15 @@ export class SessionManager {
   private startedAt = Date.now();
   private sessionLog: string[] = [];
 
+  /** The question read from the shared screen for the latest round, or
+   *  null when screen reading is off, unavailable, or unreadable. */
+  private screenQuestion: ScreenQuestion | null = null;
+
   constructor(
     private ctx: SessionContext,
     private bot: BotProvider,
     private platform: PlatformClient,
+    private vision: VisionProvider | null = null,
   ) {
     this.matcher = new RosterMatcher(ctx.roster);
     this.tracker = new SignalTracker(
@@ -80,6 +86,7 @@ export class SessionManager {
         this.presentParticipants.add(event.participantId);
         if (event.isHost) {
           this.ctx.teacherParticipantId = event.participantId;
+          this.checkIns.setTeacherLabel(event.name);
         } else {
           const match = this.matcher.match(event.participantId, event.name);
           if (match.studentId) this.presentStudents.add(match.studentId);
@@ -177,7 +184,25 @@ export class SessionManager {
         }
         // kind "ignored" (reply after the outcome was final) is consumed
         // here too, so it is never mistaken for a private question.
-        await this.bot.sendDirectMessage(this.botId, event.participantId, outcome.replyText);
+        let replyText = outcome.replyText;
+        // Real hint (Nov 5, 2026): a wrong FIRST reply in hint mode, with
+        // the screen question known, earns a hint written against the
+        // actual question and the student's actual wrong answer. Any
+        // vision failure keeps the pool reply.
+        if (
+          outcome.kind === "scored" &&
+          outcome.attempt === "first" &&
+          !outcome.correct &&
+          this.checkIns.active?.mode === "hint" &&
+          this.vision &&
+          this.screenQuestion
+        ) {
+          const hint = await this.vision
+            .makeHint(this.screenQuestion, this.checkIns.active.expectedAnswer, event.text)
+            .catch(() => null);
+          if (hint) replyText = hint;
+        }
+        await this.bot.sendDirectMessage(this.botId, event.participantId, replyText);
         // If that reply was the last outstanding one, close the round
         // now rather than waiting for the window to expire.
         if (outcome.kind === "scored" && this.checkIns.allFinal()) {
@@ -189,11 +214,19 @@ export class SessionManager {
 
     // Otherwise: a private question to the assistant.
     this.tracker.privateQuestion(studentId, now);
-    await this.bot.sendDirectMessage(
-      this.botId,
-      event.participantId,
-      replyToStudentQuestion(event.text, this.checkIns.isOpen(now)),
-    );
+    const roundOpen = this.checkIns.isOpen(now);
+    let reply = replyToStudentQuestion(event.text, roundOpen);
+    // Contextual help (Nov 5, 2026): outside an open round, with the
+    // screen question known, the vision provider answers against the
+    // actual question. During an open round the refusal above stands:
+    // the assistant never works an open check-in question for a student.
+    if (!roundOpen && this.vision && this.screenQuestion) {
+      const help = await this.vision
+        .helpWithQuestion(this.screenQuestion, event.text)
+        .catch(() => null);
+      if (help) reply = help;
+    }
+    await this.bot.sendDirectMessage(this.botId, event.participantId, reply);
   }
 
   private async handleTeacherDm(text: string, now: number): Promise<void> {
@@ -212,12 +245,47 @@ export class SessionManager {
         `Answer round open for ${studentIds.length} students. Window: ${Math.round(cmd.windowMs / 60000)} minutes. ` +
           `I have sent nothing; students will send me their answers.`,
       );
+      // Screen read runs AFTER the confirmation, in the background: the
+      // round never waits on vision. Any failure is silent (logged only).
+      void this.readScreenForRound(cmd);
       return;
     }
 
     await this.dmTeacher(
       "I did not recognise that. Commands: ANSWER | expected answer | mode: confirm-or-hint (mode optional, default hint), or PAUSE / RESUME / STOP.",
     );
+  }
+
+  /** Read the question on the shared screen for this round, keep it as
+   *  context for hints and student help, and privately warn the teacher
+   *  if the screen's worked answer disagrees with the round answer they
+   *  set (a mistyped expected answer would otherwise mark the whole
+   *  class wrong). Never throws, never blocks the round. */
+  private async readScreenForRound(cmd: { expectedAnswer: string }): Promise<void> {
+    try {
+      if (!this.botId || !this.vision) return;
+      const frame = await this.bot.getScreenFrame(this.botId);
+      if (!frame) {
+        this.log("screen read: no frame available for this round");
+        return;
+      }
+      const q = await this.vision.readQuestion(frame.pngBase64);
+      if (!q || !q.legible || !q.questionText) {
+        this.log("screen read: no legible question on screen");
+        this.screenQuestion = null;
+        return;
+      }
+      this.screenQuestion = q;
+      this.log(`screen read: question captured (${q.questionText.slice(0, 80)})`);
+      if (q.workedAnswer && !answersMatch(cmd.expectedAnswer, q.workedAnswer)) {
+        await this.dmTeacher(
+          `Heads up: the question on screen reads "${q.questionText}" and works out to ${q.workedAnswer}. ` +
+            `Your round answer is ${cmd.expectedAnswer}. You may want to check it before the round closes.`,
+        );
+      }
+    } catch (err) {
+      this.log(`screen read failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /** Close the open answer round and send the teacher the ONE combined
@@ -227,13 +295,22 @@ export class SessionManager {
   private async closeRound(now: number): Promise<void> {
     const tally = this.checkIns.close(now);
     if (!tally) return;
+    // ONE combined report (Kevoy ruling, Nov 5, 2026): who has not
+    // answered, AND who answered incorrectly with the answer they sent.
+    // Students who ended correct are not listed.
+    const parts: string[] = [];
     if (tally.nonResponders.length > 0) {
       const names = tally.nonResponders.map((id) => this.displayNameFor(id));
       for (const id of tally.nonResponders) this.tracker.nudgeSent(id);
-      await this.dmTeacher(`Haven't heard from ${names.join(", ")}. Worth calling on them next.`);
-    } else {
-      await this.dmTeacher("Everyone answered that one.");
+      parts.push(`Haven't heard from ${names.join(", ")}. Worth calling on them next.`);
     }
+    if (tally.incorrectAnswers.length > 0) {
+      const lines = tally.incorrectAnswers.map(
+        (x) => `${this.displayNameFor(x.studentId)} sent "${x.answer}"`,
+      );
+      parts.push(`Not correct: ${lines.join("; ")}.`);
+    }
+    await this.dmTeacher(parts.length > 0 ? parts.join(" ") : "Everyone answered that one.");
   }
 
   /** Periodic tick (server calls every ~15s): close an expired answer

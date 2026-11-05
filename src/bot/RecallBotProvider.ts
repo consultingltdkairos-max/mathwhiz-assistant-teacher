@@ -33,6 +33,7 @@ import type {
   BotProvider,
   BotSession,
   CreateBotRequest,
+  ScreenFrame,
 } from "./BotProvider.js";
 
 const REALTIME_EVENTS = [
@@ -50,6 +51,12 @@ export type FetchImpl = typeof fetch;
 export class RecallBotProvider implements BotProvider {
   private handler: BotEventHandler | null = null;
   private fetchImpl: FetchImpl;
+  /** Latest video frame per participant, per session (screen reading,
+   *  Nov 5, 2026). In memory only, newest frame replaces the old; frames
+   *  are never written to disk or logged. */
+  private frames = new Map<string, Map<string, ScreenFrame>>();
+  /** botId -> sessionId, so getScreenFrame can resolve its session. */
+  private botSessions = new Map<string, string>();
 
   // fetchImpl is injectable ONLY so the local demo can assert this class's
   // exact request construction against a fake HTTP layer. Production code
@@ -115,11 +122,87 @@ export class RecallBotProvider implements BotProvider {
                 },
               ]
             : [],
+        // Screen reading (Nov 5, 2026), ONLY when SCREEN_VIDEO_ENABLED=1:
+        // separate PNG video per participant over a websocket endpoint.
+        // With the flag off the Create Bot body is exactly the proven
+        // pilot shape. Separate video needs the gallery_view_v2 layout
+        // and, per Recall's docs, the web_4_core bot variant.
+        ...(this.cfg.screen.enabled
+          ? {
+              video_mixed_layout: "gallery_view_v2",
+              video_separate_png: {},
+              realtime_endpoints: [
+                {
+                  type: "webhook",
+                  url: `${this.cfg.publicBaseUrl}/recall/webhook`,
+                  events: REALTIME_EVENTS,
+                },
+                {
+                  type: "websocket",
+                  url: `${this.cfg.publicBaseUrl.replace(/^http/, "ws")}/recall/video?session=${encodeURIComponent(req.sessionId)}`,
+                  events: ["video_separate_png.data"],
+                },
+              ],
+            }
+          : {}),
       },
+      ...(this.cfg.screen.enabled ? { variant: { zoom: "web_4_core" } } : {}),
     };
 
     const bot = await this.api("/bot", { method: "POST", body: JSON.stringify(body) });
+    this.botSessions.set(bot.id, req.sessionId);
     return { botId: bot.id, sessionId: req.sessionId };
+  }
+
+  /** Ingest one realtime video websocket message for a session. Shapes
+   *  are parsed defensively across the documented nestings (the Oct 28
+   *  chat-envelope lesson); anything unrecognised is dropped, never
+   *  thrown. TODO(live): confirm the exact Zoom screenshare stream
+   *  identity (participant flag vs name) in the next fake class; the
+   *  selection heuristic in getScreenFrame prefers an explicit
+   *  screenshare flag, then a "share" name, then the freshest frame. */
+  handleVideoMessage(sessionId: string, raw: string): void {
+    let payload: any;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (payload.event && payload.event !== "video_separate_png.data") return;
+    const inner = payload.data?.data ?? payload.data ?? payload;
+    const buffer: unknown = inner?.buffer;
+    if (typeof buffer !== "string" || buffer.length === 0 || buffer.length > 4_000_000) return;
+    const participant = inner?.participant ?? {};
+    const participantId = participant?.id != null ? String(participant.id) : "unknown";
+    const name: string = String(participant?.name ?? "Unknown");
+    const isScreenshare =
+      Boolean(participant?.is_screenshare) || participant?.type === "screenshare" || /share/i.test(name);
+    let byParticipant = this.frames.get(sessionId);
+    if (!byParticipant) {
+      byParticipant = new Map();
+      this.frames.set(sessionId, byParticipant);
+    }
+    byParticipant.set(participantId, {
+      pngBase64: buffer,
+      participantName: name,
+      isScreenshare,
+      capturedAt: Date.now(),
+    });
+  }
+
+  async getScreenFrame(botId: string): Promise<ScreenFrame | null> {
+    const sessionId = this.botSessions.get(botId);
+    if (!sessionId) return null;
+    const byParticipant = this.frames.get(sessionId);
+    if (!byParticipant || byParticipant.size === 0) return null;
+    const now = Date.now();
+    const fresh = [...byParticipant.values()].filter((f) => now - f.capturedAt <= 60_000);
+    if (fresh.length === 0) return null;
+    fresh.sort((a, b) => {
+      if (a.isScreenshare !== b.isScreenshare) return a.isScreenshare ? -1 : 1;
+      return b.capturedAt - a.capturedAt;
+    });
+    return fresh[0];
   }
 
   /** Retrieve Bot: the bot's latest lifecycle status code (for example

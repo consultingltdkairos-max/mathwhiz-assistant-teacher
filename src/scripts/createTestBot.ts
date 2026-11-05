@@ -46,6 +46,7 @@ async function main(): Promise<void> {
     publicBaseUrl,
     botDisplayName: process.env.BOT_DISPLAY_NAME ?? "Assistant Teacher (AI)",
     transcriptProvider: "recallai_streaming",
+    screen: { enabled: false, visionApiKey: null, visionModel: "demo-model" },
     recall: {
       apiKey,
       region: process.env.RECALL_REGION ?? "us-west-2",
