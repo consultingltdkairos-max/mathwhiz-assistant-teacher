@@ -754,6 +754,79 @@ async function main(): Promise<void> {
     check("report capture: assistant answers recorded across rounds", (evDevonte?.checkins_answered ?? 0) >= 2, JSON.stringify(evDevonte));
   }
 
+  // ================================================================
+  heading("SCENARIO 11: conversational teacher commands (Nov 6, 2026)");
+  // ================================================================
+  const SESSION_8 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  fakeNow = Date.parse("2026-11-06T09:00:00.000Z");
+  const bot11 = new MockBotProvider(trace);
+  // A stand-in parser with the AnthropicCommandParser's contract: it
+  // extracts only when the instruction is clear, otherwise null.
+  const fakeParser = {
+    async parse(text: string) {
+      if (/answer is 36/i.test(text) && /question 2/i.test(text)) {
+        return { expectedAnswer: "36", mode: "hint" as const, windowMs: 5 * MIN, label: "Q2" };
+      }
+      return null;
+    },
+  };
+  const ctx11: SessionContext = {
+    sessionId: SESSION_8,
+    cohortId: COHORT,
+    meetingUrl: "https://zoom.us/j/00000000000",
+    joinAt: new Date(fakeNow).toISOString(),
+    teacherParticipantId: null,
+    roster: roster().slice(0, 1), // Amara only
+  };
+  const mgr11 = new SessionManager(ctx11, bot11, platform, null, fakeParser);
+  bot11.onEvent((botId, ev) => mgr11.handleEvent(botId, ev));
+  await mgr11.start();
+  await bot11.emit({ type: "bot_status", status: "in_call" });
+  await bot11.emit({ type: "participant_joined", participantId: "p-teacher", name: "Ms Rose Clarke", isHost: true });
+  await bot11.emit({ type: "participant_joined", participantId: "p-amara", name: "Amara Reid", isHost: false });
+
+  // Plain language opens the round, and the confirmation READS BACK the
+  // interpretation (answer, window, question) for the teacher to verify.
+  await bot11.emit({
+    type: "chat_message",
+    participantId: "p-teacher",
+    name: "Ms Rose Clarke",
+    to: "bot",
+    text: "For question 2 the answer is 36, give them five minutes with hints please",
+    timestamp: fakeNow,
+  });
+  check(
+    "plain-language command opened Question 2 and read the interpretation back",
+    bot11.sent.some(
+      (m) =>
+        m.toParticipantId === "p-teacher" &&
+        m.message.includes("Question 2") &&
+        m.message.includes("Window: 5 minutes") &&
+        m.message.includes("I took your answer as 36"),
+    ),
+    bot11.sent.filter((m) => m.toParticipantId === "p-teacher").map((m) => m.message).join(" | "),
+  );
+
+  // A conversational close ends the round early and reports privately.
+  await bot11.emit({ type: "chat_message", participantId: "p-teacher", name: "Ms Rose Clarke", to: "bot", text: "close Q2", timestamp: fakeNow });
+  check(
+    "conversational close ended the round with the private report",
+    bot11.sent.some(
+      (m) => m.toParticipantId === "p-teacher" && m.message.startsWith("Question 2:") && m.message.includes("Haven't heard from Amara Reid"),
+    ),
+  );
+
+  // Small talk is not a command: the template reminder comes back.
+  const before = bot11.sent.length;
+  await bot11.emit({ type: "chat_message", participantId: "p-teacher", name: "Ms Rose Clarke", to: "bot", text: "good morning everyone", timestamp: fakeNow });
+  check(
+    "non-command teacher message still gets the help reply",
+    bot11.sent.slice(before).some((m) => m.toParticipantId === "p-teacher" && m.message.includes("did not recognise")),
+  );
+
+  await bot11.emit({ type: "bot_status", status: "call_ended" });
+  check("scenario 11 payload reached the stub", stub.received.some((p) => p.session_id === SESSION_8));
+
   await stub.stop();
   heading("RESULT");
   if (failures === 0) {

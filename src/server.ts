@@ -13,6 +13,7 @@ import { RecallBotProvider } from "./bot/RecallBotProvider.js";
 import { PlatformClient } from "./platform/PlatformClient.js";
 import { SessionManager } from "./brain/SessionManager.js";
 import { AnthropicVisionProvider } from "./brain/Vision.js";
+import { AnthropicCommandParser } from "./brain/CommandParser.js";
 import type { SessionContext } from "./types.js";
 
 export function startServer(cfg: ServiceConfig): void {
@@ -22,6 +23,11 @@ export function startServer(cfg: ServiceConfig): void {
   // every screen feature falls back silently (see Vision.ts).
   const vision = cfg.screen.visionApiKey
     ? new AnthropicVisionProvider(cfg.screen.visionApiKey, cfg.screen.visionModel)
+    : null;
+  // Conversational teacher commands use the same key when present;
+  // without it, teacher commands are template-only (today's behaviour).
+  const commandParser = cfg.screen.visionApiKey
+    ? new AnthropicCommandParser(cfg.screen.visionApiKey, cfg.screen.visionModel)
     : null;
   const sessions = new Map<string, SessionManager>(); // botId -> manager
   const bySession = new Map<string, SessionManager>(); // sessionId -> manager
@@ -57,7 +63,7 @@ export function startServer(cfg: ServiceConfig): void {
 
       if (req.method === "POST" && url.pathname === "/admin/start-session") {
         const ctx = JSON.parse(raw) as SessionContext;
-        const mgr = new SessionManager(ctx, bot, platform, vision);
+        const mgr = new SessionManager(ctx, bot, platform, vision, commandParser);
         bySession.set(ctx.sessionId, mgr);
         await mgr.start();
         // Register the botId -> manager mapping so this bot's webhook

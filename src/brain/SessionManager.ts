@@ -13,6 +13,7 @@ import {
 } from "./CheckInEngine.js";
 import type { CheckIn } from "../types.js";
 import type { ScreenQuestion, VisionProvider } from "./Vision.js";
+import type { RoundCommandParser } from "./CommandParser.js";
 import { compileDraft } from "./Compiler.js";
 import { NudgeEngine } from "./NudgeEngine.js";
 import { RosterMatcher } from "./RosterMatcher.js";
@@ -84,6 +85,7 @@ export class SessionManager {
     private bot: BotProvider,
     private platform: PlatformClient,
     private vision: VisionProvider | null = null,
+    private commandParser: RoundCommandParser | null = null,
   ) {
     this.matcher = new RosterMatcher(ctx.roster);
     this.tracker = new SignalTracker(
@@ -299,7 +301,24 @@ export class SessionManager {
     if (!this.botId) return;
     if (this.nudges.handleTeacherCommand(text)) return;
 
-    const cmd = parseRoundCommand(text);
+    // Conversational close: "close", "close Q2", "close question 2".
+    const closeM = text.trim().match(/^close(?:\s+(?:the\s+)?(?:round|question))?(?:\s+(?:q|question)\s*([0-9]+))?$/i);
+    if (closeM) {
+      const label = closeM[1] ? `Q${closeM[1]}` : this.singleOpenLabel(now);
+      if (label !== null) await this.closeRound(label, now);
+      else await this.dmTeacher("No single round is open to close. Name the question, for example: close Q2.");
+      return;
+    }
+
+    // The coded template parses first: instant and exact. Plain language
+    // is the fallback, and its confirmation reads the interpretation
+    // back, so a misread is caught before the round runs.
+    let cmd = parseRoundCommand(text);
+    let viaPlainLanguage = false;
+    if (!cmd && this.commandParser) {
+      cmd = await this.commandParser.parse(text).catch(() => null);
+      viaPlainLanguage = !!cmd;
+    }
     if (cmd) {
       const studentIds = this.ctx.roster.map((r) => r.studentId).filter((id) => this.presentStudents.has(id));
       const round = this.checkIns.open(cmd, studentIds, now);
@@ -308,8 +327,11 @@ export class SessionManager {
       // opening a round sends NOTHING to students. Students DM their
       // answers to the bot; the bot scores them as they arrive.
       const labelPart = cmd.label ? ` for Question ${cmd.label.slice(1)}` : "";
+      const readBack = viaPlainLanguage
+        ? ` I took your answer as ${cmd.expectedAnswer}, mode: ${cmd.mode}. If that is wrong, close the round and resend.`
+        : "";
       await this.dmTeacher(
-        `Answer round open${labelPart} for ${studentIds.length} students. Window: ${formatWindowMs(cmd.windowMs)}. ` +
+        `Answer round open${labelPart} for ${studentIds.length} students. Window: ${formatWindowMs(cmd.windowMs)}.${readBack} ` +
           `I have sent nothing; students will send me their answers.`,
       );
       // Screen read runs AFTER the confirmation, in the background: the
@@ -319,8 +341,15 @@ export class SessionManager {
     }
 
     await this.dmTeacher(
-      "I did not recognise that. To open a round: ANSWER | expected answer | mode: hint, and you may add | time: 5 for a 5 minute window (or | time: 90s), or | Q2 when several questions are on the board. Also PAUSE / RESUME / STOP.",
+      "I did not recognise that. You can say it plainly, for example: \"For question 2 the answer is 36, give them five minutes\", or use the template: ANSWER | expected answer | mode: hint, with | time: 5 and | Q2 when you need them. Also PAUSE / RESUME / STOP, and CLOSE to end a round early.",
     );
+  }
+
+  /** The label of the one currently-open round, or null when zero or
+   *  several rounds are open (a bare CLOSE is then ambiguous). */
+  private singleOpenLabel(now: number): string | null {
+    const open = this.checkIns.openRounds(now);
+    return open.length === 1 ? open[0].label : null;
   }
 
   /** Read the questions on the shared screen for this round, keep them
